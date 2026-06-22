@@ -116,12 +116,37 @@ disk. First run downloads ~200MB of guest assets.
 **Provisioning vs runtime:** pi and its tools (fd, ripgrep) install in a separate
 one-time provisioning VM that allows npm/github. The host caches them under
 `$MYAI_HOME/sandbox/` (`pi-prefix`, `pi-bin`, etc.). Interactive `sandbox run`
-honors only your `allow_hosts` (+ loopback hosts) — github/npm are not
-auto-allowed at runtime. `sandbox run` triggers provisioning automatically when
-needed; use `--skip-provision` to skip or `--reprovision` to force a refresh.
+honors only your resolved network policy (`providers` + `allow_hosts` + loopback
+hosts) — github/npm are not auto-allowed at runtime. `sandbox run` triggers
+provisioning automatically when needed; use `--skip-provision` to skip or
+`--reprovision` to force a refresh.
 
 Config lives in repo `.myai/sandbox.json`, which overrides global
-`~/.myai/sandbox.json`. Cloud API access uses `allow_hosts` and `host_secrets`.
+`~/.myai/sandbox.json`. Cloud API access uses `providers`/`allow_hosts` and
+`host_secrets`.
+
+### Network policy
+
+The sandbox is **fail-closed**: by default (`network_policy: "custom"`) the guest
+can reach only the hosts you resolve, and an empty allow list blocks everything
+rather than opening the network. Pick providers by name instead of typing
+hostnames:
+
+```json
+{
+  "version": 2,
+  "providers": ["anthropic"],
+  "host_secrets": [{ "name": "ANTHROPIC_API_KEY", "hosts": ["api.anthropic.com"] }]
+}
+```
+
+Known providers: `anthropic`, `openai`, `openrouter`, `gemini`, `github-copilot`,
+`github`, `ollama`, `llama.cpp`. Combine `--provider` (repeatable), `--allow-host`,
+and `--network {custom,deny-all,allow-all}` for one-off runs. `allow-all` disables
+egress filtering entirely (prints a warning) — use it only when you trust the
+task. `host_secrets` values are read from the host env (or a renamed var via
+`env_var`) and injected without ever touching the command line; their hosts must
+also be allowed.
 
 ### Host loopback
 
@@ -161,9 +186,14 @@ run. Override with `--host-loopback` / `--no-host-loopback` or
 - `share_host_sessions` (default true): bind host `~/.pi/agent/sessions` so host
   and guest `pi` share one pool. `pi -r` / `pi --session <id>` work in both.
 - `guest_repo_mount`: `"host_path"` (default) mounts at the real absolute path so
-  cross-resume lines up; `"workspace"` mounts at `/workspace` (no path leak, but
-  cross-resume cwd may not line up).
+  cross-resume lines up; `"workspace"` mounts at `/workspace` (no path leak). In
+  workspace mode the `--workspace--` session slot is symlinked to the repo's real
+  session dir so shared sessions still line up.
+- `auto_approve` (default true) / `--no-auto-approve`: pi auto-approves tool calls
+  inside the sandbox. Disable to require approval even when isolated.
 - `rootfs_size` / `--rootfs-size`: grow the guest root disk (needs `e2fsprogs`).
+- `--debug`: after the run, list executables the guest tried to run but couldn't
+  find (handy when the agent reaches for a tool not installed in the image).
 
 Warm reuse: `myai sandbox register <session-id>`, `myai sandbox ls`,
 `myai sandbox snapshot <id> --repo .`, `myai sandbox stop --repo .`.

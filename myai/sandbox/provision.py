@@ -13,11 +13,20 @@ from myai.sandbox.config import (
     DEFAULT_MODEL_ID,
     GUEST_AGENT_PATH,
     PI_INSTALL_MOUNT,
+    WORKSPACE_PATH,
     SandboxConfig,
+    host_sessions_dir,
     provision_route,
     resolve_host_loopback_enabled,
     resolve_host_loopback_routes,
 )
+
+# Guest-visible paths for the --debug missing-executable audit. The staging dir
+# is host-mounted at GUEST_AGENT_PATH, so anything written here under .debug is
+# readable on the host after the VM exits.
+DEBUG_DIR = ".debug"
+DEBUG_MISSING_EXES = "missing-exes.log"
+DEBUG_INIT_SH = "init.sh"
 
 # settings.json keys we mirror from the host pi install into the guest
 HOST_PI_SETTINGS_KEYS = (
@@ -75,7 +84,7 @@ def host_pi_settings_path() -> Path:
     return Path.home() / ".pi" / "agent" / "settings.json"
 
 
-def prepare_agent_dir(repo: Path, cfg: SandboxConfig) -> Path:
+def prepare_agent_dir(repo: Path, cfg: SandboxConfig, *, debug: bool = False) -> Path:
     staging = agent_staging_dir(repo)
     if staging.exists():
         shutil.rmtree(staging)
@@ -91,7 +100,75 @@ def prepare_agent_dir(repo: Path, cfg: SandboxConfig) -> Path:
     if system_md:
         (staging / "SYSTEM.md").write_text(system_md, encoding="utf-8")
     (staging / "sessions").mkdir(exist_ok=True)
+    if debug:
+        _write_debug_init(staging)
     return staging
+
+
+def _write_debug_init(staging: Path) -> None:
+    """Write a bash init script that logs every command the guest can't find.
+
+    Sourced via ``BASH_ENV`` on every non-interactive bash, which covers the
+    ``bash -c`` calls pi makes for its shell tool. The log lives in the
+    host-mounted staging dir so we can read it back after the VM exits.
+    """
+    debug_dir = staging / DEBUG_DIR
+    debug_dir.mkdir(exist_ok=True)
+    (debug_dir / DEBUG_MISSING_EXES).write_text("", encoding="utf-8")
+    guest_log = f"{GUEST_AGENT_PATH}/{DEBUG_DIR}/{DEBUG_MISSING_EXES}"
+    script = (
+        "command_not_found_handle() {\n"
+        f'  printf "%s\\n" "$1" >> {guest_log}\n'
+        "  return 127\n"
+        "}\n"
+    )
+    (debug_dir / DEBUG_INIT_SH).write_text(script, encoding="utf-8")
+
+
+def read_debug_missing_exes(staging: Path) -> list[str]:
+    """Return sorted unique executables the guest failed to find, if any."""
+    log = staging / DEBUG_DIR / DEBUG_MISSING_EXES
+    if not log.is_file():
+        return []
+    names = {line.strip() for line in log.read_text(encoding="utf-8").splitlines() if line.strip()}
+    return sorted(names)
+
+
+def session_dir_name(path: str) -> str:
+    """Encode an absolute path to pi's session directory name (``--a-b-c--``)."""
+    inner = path.lstrip("/").replace("/", "-")
+    return f"--{inner}--"
+
+
+def prepare_workspace_session_link(repo: Path, cfg: SandboxConfig) -> Path | None:
+    """Link the ``/workspace`` session slot to the repo's real session dir.
+
+    In ``workspace`` mount mode the guest cwd is ``/workspace``, so pi names its
+    session dir ``--workspace--`` instead of one derived from the repo path. With
+    shared host sessions that would orphan sessions in a slot unrelated to the
+    repo. We symlink ``--workspace--`` to the repo's real session dir so host and
+    guest share one pool. No-op for ``host_path`` mode or when sessions aren't
+    shared. Returns the link path to clean up, or None.
+    """
+    if cfg.guest_repo_mount != "workspace" or not cfg.share_host_sessions:
+        return None
+    sessions = host_sessions_dir()
+    sessions.mkdir(parents=True, exist_ok=True)
+    link = sessions / session_dir_name(WORKSPACE_PATH)
+    target = sessions / session_dir_name(str(repo.resolve()))
+    target.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        link.unlink()  # stale link from a crashed run
+    elif link.exists():
+        return None  # real dir already there, leave it
+    link.symlink_to(target)
+    return link
+
+
+def cleanup_workspace_session_link(link: Path | None) -> None:
+    """Remove the ``--workspace--`` symlink created by prepare_workspace_session_link."""
+    if link is not None and link.is_symlink():
+        link.unlink()
 
 
 def loopback_guest_host(cfg: SandboxConfig) -> str | None:
@@ -202,7 +279,7 @@ def render_global_system_md() -> str | None:
     return None
 
 
-def guest_agent_env(cfg: SandboxConfig) -> list[str]:
+def guest_agent_env(cfg: SandboxConfig, *, debug: bool = False) -> list[str]:
     env = [f"PI_CODING_AGENT_DIR={GUEST_AGENT_PATH}"]
     # forward TERM so the guest pi TUI uses cursor addressing / alt screen instead
     # of reprinting whole frames into scrollback
@@ -213,6 +290,8 @@ def guest_agent_env(cfg: SandboxConfig) -> list[str]:
         if guest_host:
             url = _rewrite_localhost(url, guest_host)
         env.append(f"LLAMA_SERVER_URL={url}")
+    if debug:
+        env.append(f"BASH_ENV={GUEST_AGENT_PATH}/{DEBUG_DIR}/{DEBUG_INIT_SH}")
     return env
 
 
@@ -255,7 +334,7 @@ def build_pi_launch_shell(
     workspace_path: str,
 ) -> tuple[str, list[str]]:
     args = list(pi_args)
-    if "-a" not in args and "--approve" not in args:
+    if cfg.auto_approve and "-a" not in args and "--approve" not in args:
         args = ["-a", *args]
 
     # When mirroring host pi, the host settings.json drives provider/model so we

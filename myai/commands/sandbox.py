@@ -44,6 +44,19 @@ def _register_run(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--path", default=".", help="Repo path (default: cwd)")
     parser.add_argument("--model-endpoint", help="Host model base URL (overrides config)")
     parser.add_argument("--allow-host", action="append", dest="allow_hosts", default=[])
+    parser.add_argument(
+        "--provider",
+        action="append",
+        dest="providers",
+        default=[],
+        help="Allow a known provider's domains (e.g. anthropic, openai); repeatable",
+    )
+    parser.add_argument(
+        "--network",
+        dest="network_policy",
+        choices=["custom", "deny-all", "allow-all"],
+        help="Network policy (default: custom; allow-all disables egress filtering)",
+    )
     parser.add_argument("--vmm", choices=["auto", "qemu", "krun"], help="VM backend")
     parser.add_argument("--image", help="Gondolin image ref")
     parser.add_argument(
@@ -64,6 +77,16 @@ def _register_run(subparsers: argparse._SubParsersAction) -> None:
         help="Re-run pi provisioning even if already cached",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Report executables the guest tried to run but couldn't find",
+    )
+    parser.add_argument(
+        "--no-auto-approve",
+        action="store_true",
+        help="Don't auto-approve pi tool calls (omit the injected -a flag)",
+    )
     parser.add_argument(
         "--mirror-host-pi",
         action="store_true",
@@ -154,6 +177,7 @@ def run_run(args: argparse.Namespace) -> int:
             skip_provision=args.skip_provision,
             reprovision=args.reprovision,
             quiet=args.quiet,
+            debug=args.debug,
         )
     except (SandboxConfigError, GondolinError, SessionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -224,7 +248,7 @@ def run_snapshot(args: argparse.Namespace) -> int:
         if args.repo:
             repo = Path(args.repo).resolve()
             resume_id = _parse_resume_id(output) or args.session_id
-            register_session(repo, session_id=None, resume_id=resume_id)
+            register_session(repo, session_id=None, resume_id=resume_id, alive=False)
             print(f"registered resume {resume_id} for {repo}")
         return 0
     except GondolinError as exc:
@@ -263,6 +287,12 @@ def _cfg_from_args(repo: Path, args: argparse.Namespace) -> SandboxConfig:
         cfg.host_loopback.enabled = True
     if args.allow_hosts:
         cfg.allow_hosts = list(args.allow_hosts)
+    if getattr(args, "providers", None):
+        cfg.providers = list(args.providers)
+    if getattr(args, "network_policy", None):
+        cfg.network_policy = args.network_policy
+    if getattr(args, "no_auto_approve", False):
+        cfg.auto_approve = False
     if args.vmm:
         cfg.vmm = args.vmm
     if args.image:

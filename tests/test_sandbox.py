@@ -6,10 +6,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from myai.sandbox.config import (
+    DENY_ALL_SENTINEL,
     DEFAULT_MODEL_ENDPOINT,
     GUEST_AGENT_PATH,
     HostLoopbackConfig,
     HostLoopbackRoute,
+    HostSecret,
     RouteProvision,
     SandboxConfig,
     SandboxConfigError,
@@ -27,7 +29,9 @@ from myai.sandbox.config import (
     resolve_host_loopback_enabled,
     resolve_host_loopback_routes,
     resolve_model_endpoint,
+    resolve_provider_domains,
     rewrite_endpoint_for_guest,
+    runtime_allow_host_args,
     save_repo_config,
 )
 from myai.sandbox.doctor import doctor_ok, run_doctor
@@ -35,14 +39,18 @@ from myai.sandbox.gondolin import build_provision_plan, build_run_plan
 from myai.sandbox.provision import (
     build_pi_launch_shell,
     build_provision_shell,
+    cleanup_workspace_session_link,
     guest_agent_env,
     is_provisioned,
     needs_provision,
     pi_bin_dir,
     pi_install_dir,
     prepare_agent_dir,
+    prepare_workspace_session_link,
+    read_debug_missing_exes,
     render_guest_settings,
     render_models_json,
+    session_dir_name,
 )
 
 
@@ -502,7 +510,11 @@ class GondolinPlanTests(SandboxTestCase):
                 install_pi_at_boot=False,
                 host_secrets=[HostSecret(name="OPENAI_API_KEY", hosts=["api.openai.com"])],
             )
-            plan = build_run_plan(repo, cfg, [])
+            os.environ["OPENAI_API_KEY"] = "sk-test"
+            try:
+                plan = build_run_plan(repo, cfg, [])
+            finally:
+                os.environ.pop("OPENAI_API_KEY", None)
             self.assertIn("--host-secret", plan.cmd)
             self.assertIn("OPENAI_API_KEY@api.openai.com", plan.cmd)
 
@@ -735,6 +747,205 @@ class DoctorTests(unittest.TestCase):
             CheckResult("krun", False, "", "optional"),
         ]
         self.assertTrue(doctor_ok(ok))
+
+
+class NetworkPolicyTests(SandboxTestCase):
+    def test_default_policy_is_custom(self) -> None:
+        self.assertEqual(SandboxConfig().network_policy, "custom")
+
+    def test_invalid_network_policy(self) -> None:
+        with self.assertRaises(SandboxConfigError):
+            SandboxConfig(network_policy="open").validate()
+
+    def test_custom_empty_collapses_to_sentinel_not_unrestricted(self) -> None:
+        hosts, unrestricted = runtime_allow_host_args(SandboxConfig())
+        self.assertEqual(hosts, [DENY_ALL_SENTINEL])
+        self.assertFalse(unrestricted)
+
+    def test_deny_all_passes_sentinel_only(self) -> None:
+        cfg = SandboxConfig(network_policy="deny-all", allow_hosts=["api.openai.com"])
+        hosts, unrestricted = runtime_allow_host_args(cfg)
+        self.assertEqual(hosts, [DENY_ALL_SENTINEL])
+        self.assertFalse(unrestricted)
+
+    def test_allow_all_is_unrestricted_with_no_flags(self) -> None:
+        hosts, unrestricted = runtime_allow_host_args(SandboxConfig(network_policy="allow-all"))
+        self.assertEqual(hosts, [])
+        self.assertTrue(unrestricted)
+
+    def test_custom_with_hosts_passes_hosts(self) -> None:
+        cfg = SandboxConfig(allow_hosts=["api.openai.com"], install_pi_at_boot=False)
+        hosts, unrestricted = runtime_allow_host_args(cfg)
+        self.assertEqual(hosts, ["api.openai.com"])
+        self.assertFalse(unrestricted)
+
+    def test_build_run_plan_fails_closed_by_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(install_pi_at_boot=False)
+            plan = build_run_plan(repo, cfg, [])
+            allow = [plan.cmd[i + 1] for i, f in enumerate(plan.cmd) if f == "--allow-host"]
+            self.assertEqual(allow, [DENY_ALL_SENTINEL])
+
+    def test_build_run_plan_allow_all_passes_no_allow_host(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(install_pi_at_boot=False, network_policy="allow-all")
+            plan = build_run_plan(repo, cfg, [])
+            self.assertNotIn("--allow-host", plan.cmd)
+
+
+class ProviderPresetTests(SandboxTestCase):
+    def test_resolve_known_provider(self) -> None:
+        cfg = SandboxConfig(providers=["anthropic"])
+        self.assertEqual(resolve_provider_domains(cfg), ["api.anthropic.com"])
+
+    def test_unknown_provider_rejected(self) -> None:
+        with self.assertRaises(SandboxConfigError):
+            SandboxConfig(providers=["bogus"]).validate()
+
+    def test_providers_merged_into_allow_hosts(self) -> None:
+        cfg = SandboxConfig(providers=["anthropic"], allow_hosts=["x.example.com"], install_pi_at_boot=False)
+        hosts = effective_allow_hosts(cfg)
+        self.assertIn("api.anthropic.com", hosts)
+        self.assertIn("x.example.com", hosts)
+
+    def test_provider_domains_reach_run_plan(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(providers=["openai"], install_pi_at_boot=False)
+            plan = build_run_plan(repo, cfg, [])
+            allow = [plan.cmd[i + 1] for i, f in enumerate(plan.cmd) if f == "--allow-host"]
+            self.assertIn("api.openai.com", allow)
+            self.assertNotIn(DENY_ALL_SENTINEL, allow)
+
+
+class SecretEnvTests(SandboxTestCase):
+    def test_env_var_rename_maps_value(self) -> None:
+        from myai.sandbox.gondolin import secret_child_env
+
+        cfg = SandboxConfig(host_secrets=[HostSecret(name="GH_TOKEN", hosts=["api.github.com"], env_var="MY_PAT")])
+        env, missing = secret_child_env(cfg, {"MY_PAT": "abc"})
+        self.assertEqual(env["GH_TOKEN"], "abc")
+        self.assertEqual(missing, [])
+
+    def test_missing_secret_reported(self) -> None:
+        from myai.sandbox.gondolin import secret_child_env
+
+        cfg = SandboxConfig(host_secrets=[HostSecret(name="GH_TOKEN", hosts=["api.github.com"])])
+        env, missing = secret_child_env(cfg, {})
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertEqual(missing, ["GH_TOKEN"])
+
+    def test_secret_value_not_on_argv(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(
+                install_pi_at_boot=False,
+                host_secrets=[HostSecret(name="GH_TOKEN", hosts=["api.github.com"], env_var="MY_PAT")],
+            )
+            os.environ["MY_PAT"] = "secret-value"
+            try:
+                plan = build_run_plan(repo, cfg, [])
+            finally:
+                os.environ.pop("MY_PAT", None)
+            self.assertNotIn("secret-value", " ".join(plan.cmd))
+            self.assertIn("GH_TOKEN@api.github.com", plan.cmd)
+            self.assertEqual(plan.env["GH_TOKEN"], "secret-value")
+
+
+class AutoApproveTests(SandboxTestCase):
+    def test_auto_approve_injects_a(self) -> None:
+        cfg = SandboxConfig(install_pi_at_boot=False)
+        _, args = build_pi_launch_shell(cfg, ["-p", "hi"], WORKSPACE_PATH)
+        self.assertIn("-a", args)
+
+    def test_no_auto_approve_omits_a(self) -> None:
+        cfg = SandboxConfig(install_pi_at_boot=False, auto_approve=False)
+        _, args = build_pi_launch_shell(cfg, ["-p", "hi"], WORKSPACE_PATH)
+        self.assertNotIn("-a", args)
+
+
+class WorkspaceSessionLinkTests(SandboxTestCase):
+    def test_session_dir_name_encoding(self) -> None:
+        self.assertEqual(session_dir_name("/workspace"), "--workspace--")
+        self.assertEqual(session_dir_name("/home/a/proj"), "--home-a-proj--")
+
+    def test_no_link_for_host_path_mode(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(guest_repo_mount="host_path")
+            self.assertIsNone(prepare_workspace_session_link(repo, cfg))
+
+    def test_workspace_mode_links_to_repo_session_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            sessions = Path(tmp) / "sessions"
+            cfg = SandboxConfig(guest_repo_mount="workspace", share_host_sessions=True)
+            with patch("myai.sandbox.provision.host_sessions_dir", return_value=sessions):
+                link = prepare_workspace_session_link(repo, cfg)
+                self.assertIsNotNone(link)
+                assert link is not None
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.name, "--workspace--")
+                self.assertEqual(
+                    link.resolve(),
+                    (sessions / session_dir_name(str(repo.resolve()))).resolve(),
+                )
+                cleanup_workspace_session_link(link)
+                self.assertFalse(link.exists())
+
+    def test_no_link_when_sessions_not_shared(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(guest_repo_mount="workspace", share_host_sessions=False)
+            self.assertIsNone(prepare_workspace_session_link(repo, cfg))
+
+
+class DebugAuditTests(SandboxTestCase):
+    def test_prepare_agent_dir_writes_debug_init(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            staging = prepare_agent_dir(repo, SandboxConfig(), debug=True)
+            init = staging / ".debug" / "init.sh"
+            self.assertTrue(init.is_file())
+            self.assertIn("command_not_found_handle", init.read_text())
+
+    def test_no_debug_dir_without_debug(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            self.assertFalse((staging / ".debug").exists())
+
+    def test_guest_env_sets_bash_env_in_debug(self) -> None:
+        env = guest_agent_env(SandboxConfig(), debug=True)
+        self.assertTrue(any(e.startswith("BASH_ENV=") for e in env))
+        self.assertFalse(any(e.startswith("BASH_ENV=") for e in guest_agent_env(SandboxConfig())))
+
+    def test_read_debug_missing_exes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            staging = Path(tmp)
+            (staging / ".debug").mkdir()
+            (staging / ".debug" / "missing-exes.log").write_text("cargo\nrustc\ncargo\n")
+            self.assertEqual(read_debug_missing_exes(staging), ["cargo", "rustc"])
+
+    def test_read_debug_missing_exes_empty_when_absent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(read_debug_missing_exes(Path(tmp)), [])
+
+
+class ConfigRoundtripNewFieldsTests(SandboxTestCase):
+    def test_new_fields_roundtrip(self) -> None:
+        cfg = SandboxConfig(
+            network_policy="deny-all",
+            providers=["anthropic", "github"],
+            auto_approve=False,
+        )
+        loaded = _config_from_dict(_config_to_dict(cfg))
+        self.assertEqual(loaded.network_policy, "deny-all")
+        self.assertEqual(loaded.providers, ["anthropic", "github"])
+        self.assertFalse(loaded.auto_approve)
 
 
 if __name__ == "__main__":

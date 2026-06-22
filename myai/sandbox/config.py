@@ -31,6 +31,35 @@ WORKSPACE_PATH = "/workspace"
 VMM_CHOICES = ("auto", "qemu", "krun")
 GUEST_REPO_MOUNT_CHOICES = ("host_path", "workspace")
 
+NETWORK_POLICY_CHOICES = ("custom", "deny-all", "allow-all")
+DEFAULT_NETWORK_POLICY = "custom"
+
+# gondolin only installs egress hooks when given >=1 --allow-host; with zero
+# flags the network is wide open. Passing a host the guest never contacts forces
+# the hooks on, so deny-all actually denies.
+DENY_ALL_SENTINEL = "deny-all.sandbox.invalid"
+
+# Known providers mapped to the domains they need, so users allow a name instead
+# of hand-listing hosts.
+PROVIDER_DOMAINS: dict[str, list[str]] = {
+    "anthropic": ["api.anthropic.com"],
+    "openai": ["api.openai.com"],
+    "openrouter": ["openrouter.ai"],
+    "gemini": [
+        "generativelanguage.googleapis.com",
+        "oauth2.googleapis.com",
+        "www.googleapis.com",
+    ],
+    "github-copilot": [
+        "*.githubcopilot.com",
+        "api.github.com",
+        "copilot-proxy.githubusercontent.com",
+    ],
+    "github": ["github.com", "*.github.com", "*.githubusercontent.com"],
+    "ollama": ["localhost", "127.0.0.1"],
+    "llama.cpp": ["localhost", "127.0.0.1"],
+}
+
 
 class SandboxConfigError(Exception):
     pass
@@ -97,7 +126,10 @@ class SandboxConfig:
     guest_model_host: str = DEFAULT_GUEST_MODEL_HOST
     model_id: str = DEFAULT_MODEL_ID
     provider: str = DEFAULT_PROVIDER
+    network_policy: str = DEFAULT_NETWORK_POLICY
+    providers: list[str] = field(default_factory=list)
     allow_hosts: list[str] = field(default_factory=list)
+    auto_approve: bool = True
     gondolin_package: str = DEFAULT_GONDOLIN_PACKAGE
     gondolin_version: str = DEFAULT_GONDOLIN_VERSION
     image: str = DEFAULT_IMAGE
@@ -122,6 +154,15 @@ class SandboxConfig:
     def validate(self) -> None:
         if self.vmm not in VMM_CHOICES:
             raise SandboxConfigError(f"unknown vmm {self.vmm!r}, expected one of {VMM_CHOICES}")
+        if self.network_policy not in NETWORK_POLICY_CHOICES:
+            raise SandboxConfigError(
+                f"unknown network_policy {self.network_policy!r}, "
+                f"expected one of {NETWORK_POLICY_CHOICES}"
+            )
+        for provider in self.providers:
+            if provider not in PROVIDER_DOMAINS:
+                known = ", ".join(sorted(PROVIDER_DOMAINS))
+                raise SandboxConfigError(f"unknown provider {provider!r}; known: {known}")
         if self.guest_repo_mount not in GUEST_REPO_MOUNT_CHOICES:
             raise SandboxConfigError(
                 f"unknown guest_repo_mount {self.guest_repo_mount!r}, "
@@ -335,7 +376,10 @@ def _config_from_dict(data: dict) -> SandboxConfig:
         guest_model_host=data.get("guest_model_host", DEFAULT_GUEST_MODEL_HOST),
         model_id=data.get("model_id", DEFAULT_MODEL_ID),
         provider=data.get("provider", DEFAULT_PROVIDER),
+        network_policy=data.get("network_policy", DEFAULT_NETWORK_POLICY),
+        providers=list(data.get("providers", [])),
         allow_hosts=list(data.get("allow_hosts", [])),
+        auto_approve=data.get("auto_approve", True),
         gondolin_package=data.get("gondolin_package", DEFAULT_GONDOLIN_PACKAGE),
         gondolin_version=data.get("gondolin_version", DEFAULT_GONDOLIN_VERSION),
         image=data.get("image", DEFAULT_IMAGE),
@@ -440,7 +484,10 @@ def _config_to_dict(cfg: SandboxConfig) -> dict:
         "guest_model_host": cfg.guest_model_host,
         "model_id": cfg.model_id,
         "provider": cfg.provider,
+        "network_policy": cfg.network_policy,
+        "providers": cfg.providers,
         "allow_hosts": cfg.allow_hosts,
+        "auto_approve": cfg.auto_approve,
         "gondolin_package": cfg.gondolin_package,
         "gondolin_version": cfg.gondolin_version,
         "image": cfg.image,
@@ -507,9 +554,38 @@ def _append_loopback_hosts(hosts: list[str], cfg: SandboxConfig) -> list[str]:
     return hosts
 
 
+def resolve_provider_domains(cfg: SandboxConfig) -> list[str]:
+    """Expand cfg.providers into their domain lists, preserving order, deduped."""
+    out: list[str] = []
+    for provider in cfg.providers:
+        for domain in PROVIDER_DOMAINS.get(provider, []):
+            if domain not in out:
+                out.append(domain)
+    return out
+
+
 def effective_allow_hosts(cfg: SandboxConfig) -> list[str]:
-    """Runtime allow list: user config + loopback hosts only."""
-    return _append_loopback_hosts(list(cfg.allow_hosts), cfg)
+    """Runtime allow list: provider presets + user hosts + loopback hosts."""
+    hosts: list[str] = []
+    for host in (*resolve_provider_domains(cfg), *cfg.allow_hosts):
+        if host not in hosts:
+            hosts.append(host)
+    return _append_loopback_hosts(hosts, cfg)
+
+
+def runtime_allow_host_args(cfg: SandboxConfig) -> tuple[list[str], bool]:
+    """Runtime --allow-host values and whether egress is unrestricted.
+
+    For allow-all returns ([], True): pass no flags. Otherwise the list is never
+    empty so gondolin installs hooks; an empty custom list collapses to the
+    deny-all sentinel (fail-closed) instead of gondolin's open default.
+    """
+    if cfg.network_policy == "allow-all":
+        return [], True
+    if cfg.network_policy == "deny-all":
+        return [DENY_ALL_SENTINEL], False
+    hosts = effective_allow_hosts(cfg)
+    return (hosts or [DENY_ALL_SENTINEL]), False
 
 
 def provision_allow_hosts(cfg: SandboxConfig) -> list[str]:
