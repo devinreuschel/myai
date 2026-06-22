@@ -72,4 +72,78 @@ uv run myai --help
 uv sync
 uv run myai --help
 uv run python -m myai --help
+uv run python -m unittest discover -s tests
 ```
+
+## Sandbox (pi in a micro-VM)
+
+Run `pi` inside a Gondolin micro-VM. The repo is mounted at its real host path by
+default, so it feels like plain `pi` but the process is hardware-isolated.
+
+```bash
+myai sandbox doctor          # check Node, QEMU, disk, etc.
+myai sandbox init            # write .myai/sandbox.json
+myai sandbox provision       # one-time pi install (allows npm/github)
+myai sandbox run             # interactive pi in the VM
+myai sandbox run -- -- -p "hello"   # pass args to pi
+```
+
+Prerequisites: Node.js >= 23.6, QEMU (or krun on Apple Silicon), ~5 GiB free
+disk. First run downloads ~200MB of guest assets.
+
+**Provisioning vs runtime:** pi and its tools (fd, ripgrep) install in a separate
+one-time provisioning VM that allows npm/github. The host caches them under
+`$MYAI_HOME/sandbox/` (`pi-prefix`, `pi-bin`, etc.). Interactive `sandbox run`
+honors only your `allow_hosts` (+ loopback hosts) — github/npm are not
+auto-allowed at runtime. `sandbox run` triggers provisioning automatically when
+needed; use `--skip-provision` to skip or `--reprovision` to force a refresh.
+
+Config lives in repo `.myai/sandbox.json`, which overrides global
+`~/.myai/sandbox.json`. Cloud API access uses `allow_hosts` and `host_secrets`.
+
+### Host loopback
+
+Off by default (cloud-first). Set `host_loopback.enabled` to `true` to map host
+ports into the guest so it can reach local services (models, MCP, etc.):
+
+```json
+{
+  "version": 2,
+  "host_loopback": {
+    "enabled": true,
+    "routes": [
+      {
+        "id": "model",
+        "guest_host": "model.host",
+        "upstream": "http://localhost:8080/v1",
+        "provision": { "provider": "myai-local", "model_id": "local" }
+      }
+    ]
+  }
+}
+```
+
+`MYAI_MODEL_ENDPOINT` or `--model-endpoint URL` enables loopback for a single
+run. Override with `--host-loopback` / `--no-host-loopback` or
+`MYAI_HOST_LOOPBACK=1|0`. With `routes` empty, the legacy flat fields
+(`model_endpoint`, `guest_model_host`, `provider`, `model_id`) are used instead.
+
+### Other knobs
+
+- `mirror_host_pi` / `--mirror-host-pi`: mirror host `~/.pi/agent/settings.json`
+  (packages, default provider/model/thinking level, theme) into the guest.
+  Localhost provider URLs are rewritten to the loopback host. Packages install
+  once during provisioning (git/npm/github allowed there, not at runtime).
+- `llama_server_url`: passed to the guest as `LLAMA_SERVER_URL` (localhost
+  rewritten to the loopback host) for the `pi-llama-cpp` extension.
+- `share_host_sessions` (default true): bind host `~/.pi/agent/sessions` so host
+  and guest `pi` share one pool. `pi -r` / `pi --session <id>` work in both.
+- `guest_repo_mount`: `"host_path"` (default) mounts at the real absolute path so
+  cross-resume lines up; `"workspace"` mounts at `/workspace` (no path leak, but
+  cross-resume cwd may not line up).
+- `rootfs_size` / `--rootfs-size`: grow the guest root disk (needs `e2fsprogs`).
+
+Warm reuse: `myai sandbox register <session-id>`, `myai sandbox ls`,
+`myai sandbox snapshot <id> --repo .`, `myai sandbox stop --repo .`.
+
+Custom pi image: see [myai/sandbox/image/README.md](myai/sandbox/image/README.md).
