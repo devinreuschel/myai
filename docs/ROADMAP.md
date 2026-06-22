@@ -25,6 +25,21 @@ Install myai without PyPI via a curl one-liner.
 - [x] Uninstall path (`install.sh --uninstall`)
 - [x] Extensible install backends (`git` now; stub hooks for `pypi` / `release` later)
 
+### Phase 2b: Shared agent rule layer
+
+Central repo for rules, skills, and subagents synced to managed repos (cursor, claude, pi).
+
+- [x] `myai/paths.py`: state root from `MYAI_HOME` / XDG
+- [x] Global registry at `agentsync.json` (master path + managed repos)
+- [x] `myai master init`: scaffold master repo dirs and register master
+- [x] `myai init`: per-repo config (`.myai/config.json`) + overwrite warning
+- [x] `myai sync`: render rules/skills/subagents to agent-native paths; tracked-only prune
+- [x] `myai status`: master + repo drift summary
+- [x] Renderers: cursor `.mdc`, claude/pi managed blocks in `CLAUDE.md`/`AGENTS.md`, skill dirs
+- [x] Claude subagent rendering (`.claude/agents/<name>.md`)
+- [ ] Reverse propagation (repo -> master)
+- [ ] Auto `git pull` master before sync
+
 ### Phase 3: Prerequisite checks
 
 Verify the host has what we need before we try to build anything, with clear messages when something's missing.
