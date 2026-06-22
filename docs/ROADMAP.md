@@ -35,7 +35,8 @@ Central repo for rules, skills, and subagents synced to managed repos (cursor, c
 - [x] `myai init`: per-repo config (`.myai/config.json`) + overwrite warning
 - [x] `myai sync`: render rules/skills/subagents to agent-native paths; tracked-only prune
 - [x] `myai status`: master + repo drift summary
-- [x] Renderers: cursor `.mdc`, claude/pi managed blocks in `CLAUDE.md`/`AGENTS.md`, skill dirs
+- [x] Renderers: cursor `.mdc`, claude `.claude/rules/*.md`, claude/pi managed blocks in `CLAUDE.md`/`AGENTS.md`, skill dirs
+- [x] `nested_rules` toggle: nesting-capable agents (cursor, claude) emit nested rule files or flatten; pi always flattens
 - [x] Claude subagent rendering (`.claude/agents/<name>.md`)
 - [ ] Reverse propagation (repo -> master)
 - [ ] Auto `git pull` master before sync

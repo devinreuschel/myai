@@ -59,7 +59,7 @@ def compute_sync(repo: Path, cfg: RepoConfig, old_state: RepoState) -> SyncPlan:
     rules, skills, subagents = resolve_selection(
         master, cfg.rules, cfg.skills, cfg.subagents
     )
-    plan = build_plan(repo, cfg.agents, rules, skills, subagents)
+    plan = build_plan(repo, cfg.agents, rules, skills, subagents, cfg.nested_rules)
 
     actions: list[SyncAction] = []
     new_state = RepoState(files={}, blocks={})

@@ -16,12 +16,15 @@ class ConfigError(Exception):
 
 @dataclass
 class RepoConfig:
+    """Per-repo agentsync config stored in .myai/config.json."""
+
     version: int = CONFIG_VERSION
     managed: bool = True
     agents: list[str] = field(default_factory=lambda: list(AGENTS))
     rules: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     subagents: list[str] = field(default_factory=list)
+    nested_rules: bool = True
 
     def validate(self) -> None:
         for agent in self.agents:
@@ -62,6 +65,7 @@ def load_config(repo: Path) -> RepoConfig:
         rules=list(data.get("rules", [])),
         skills=list(data.get("skills", [])),
         subagents=list(data.get("subagents", [])),
+        nested_rules=data.get("nested_rules", True),
     )
     cfg.validate()
     return cfg
@@ -78,6 +82,7 @@ def save_config(repo: Path, cfg: RepoConfig) -> None:
         "rules": cfg.rules,
         "skills": cfg.skills,
         "subagents": cfg.subagents,
+        "nested_rules": cfg.nested_rules,
     }
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 

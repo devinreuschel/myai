@@ -9,10 +9,11 @@ from myai.agentsync.registry import add_repo, get_master
 OVERWRITE_WARNING = """\
 WARNING: this repo will be managed by myai.
 
-Syncs overwrite agent config files that myai writes (.cursor/rules, .claude/skills,
-.pi/skills, managed blocks in CLAUDE.md/AGENTS.md, etc).
+Syncs overwrite agent config files that myai writes (.cursor/rules, .claude/rules,
+.claude/skills, .pi/skills, managed blocks in CLAUDE.md/AGENTS.md, etc).
 
 Edit rules and skills in the master repo, not in this repo.
+Use --flat-rules to flatten rules into AGENTS.md/CLAUDE.md instead of nested files.
 """
 
 
@@ -48,6 +49,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         dest="subagents",
         default=[],
         help="Subagent name from master (repeatable)",
+    )
+    parser.add_argument(
+        "--flat-rules",
+        action="store_true",
+        help="Flatten rules into AGENTS.md/CLAUDE.md instead of nested rule files",
     )
     parser.add_argument(
         "--path",
@@ -90,6 +96,7 @@ def run(args: argparse.Namespace) -> int:
         rules=args.rules or [],
         skills=args.skills or [],
         subagents=args.subagents or [],
+        nested_rules=not args.flat_rules,
     )
     save_config(repo, cfg)
     add_repo(repo)

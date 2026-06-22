@@ -6,6 +6,28 @@ The difference: instead of shipping a vendored binary, myai clones and builds ll
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the project roadmap.
 
+## Agent rule sync
+
+Central repo for rules, skills, and subagents synced to managed repos (cursor, claude, pi).
+
+```bash
+myai master init              # scaffold master repo dirs
+myai init --agent cursor --rule general   # per-repo config
+myai init --flat-rules        # flatten rules into AGENTS.md/CLAUDE.md
+myai sync                     # apply rules/skills to agent-native paths
+myai status                   # drift summary
+```
+
+Config lives in `.myai/config.json`. Key fields:
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `agents` | all three | which tools to sync (`cursor`, `claude`, `pi`) |
+| `rules` | `[]` | rule selectors from master repo |
+| `nested_rules` | `true` | nested rule files vs flattened blocks |
+
+With `nested_rules: true` (default), cursor writes `.cursor/rules/*.mdc` and claude writes `.claude/rules/*.md`; pi always flattens to `AGENTS.md`. With `nested_rules: false`, cursor and claude flatten too (cursor+pi share `AGENTS.md`). See [docs/DESIGN.md](docs/DESIGN.md) for details.
+
 ## Requirements
 
 On your machine:

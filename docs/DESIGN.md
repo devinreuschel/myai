@@ -1,5 +1,36 @@
 # Design notes
 
+## Agent rule sync
+
+Rules live in a master repo and sync to managed repos via `myai sync`. Each repo
+declares which agents it manages in `.myai/config.json` (`cursor`, `claude`, `pi`).
+
+### Nested vs flat rules
+
+`nested_rules` (default `true`) controls how nesting-capable agents get rules:
+
+| Agent | Nested (`nested_rules: true`) | Flat (`nested_rules: false`) |
+|-------|--------------------------------|------------------------------|
+| cursor | `.cursor/rules/<name>.mdc` | managed block in `AGENTS.md` |
+| claude | `.claude/rules/<name>.md` | managed block in `CLAUDE.md` |
+| pi | (not supported) | managed block in `AGENTS.md` |
+
+Pi is flat-only. When cursor and pi both flatten, they share one `AGENTS.md`
+block (rules merged, deduped by name). When cursor and pi both run with nested
+rules, cursor gets nested files and pi gets `AGENTS.md` (the "wasteful" case).
+
+Set at init with `--flat-rules` or edit `.myai/config.json` directly.
+
+### Per-agent capabilities
+
+Capabilities are defined in `myai/agentsync/render.py` (`AGENT_CAPS`):
+
+- **cursor**: nested `.mdc` files with `globs`/`alwaysApply` frontmatter; skills at `.cursor/skills/`
+- **claude**: nested `.md` files under `.claude/rules/` (Claude Code discovers them recursively); skills at `.claude/skills/`; subagents at `.claude/agents/`
+- **pi**: flat-only; skills at `.pi/skills/`
+
+Rules can be scoped per-agent via frontmatter `agents: [cursor, claude]`.
+
 ## Agent sandbox: phasing and escape hatches
 
 We run interactive `pi` inside a microVM so it feels like plain `pi` but the
