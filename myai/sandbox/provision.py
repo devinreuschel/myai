@@ -4,7 +4,8 @@ import os
 import shutil
 from pathlib import Path
 
-from myai.agentsync.master import filter_rules_for_agent, list_rules, resolve_selection
+from myai.agentsync.config import ConfigError, load_config
+from myai.agentsync.master import filter_rules_for_agent, resolve_selection
 from myai.agentsync.registry import get_master
 from myai.agentsync.render import render_rules_block
 from myai.paths import sandbox_root
@@ -93,7 +94,7 @@ def prepare_agent_dir(repo: Path, cfg: SandboxConfig, *, debug: bool = False) ->
     settings = render_guest_settings(cfg)
     if settings:
         (staging / "settings.json").write_text(settings, encoding="utf-8")
-    agents_md = render_global_agents_md()
+    agents_md = render_agents_md(repo)
     if agents_md:
         (staging / "AGENTS.md").write_text(agents_md, encoding="utf-8")
     system_md = render_global_system_md()
@@ -253,17 +254,25 @@ def render_models_json(cfg: SandboxConfig) -> str:
     return json.dumps({"providers": providers}, indent=2) + "\n"
 
 
-def render_global_agents_md() -> str | None:
+def render_agents_md(repo: Path) -> str | None:
+    """Flatten the repo's pi rules for the guest, or None when not applicable.
+
+    Only managed repos that don't already target pi get rules injected; a
+    pi-targeting repo already carries its own synced AGENTS.md in the workspace.
+    """
+    try:
+        cfg = load_config(repo)
+    except ConfigError:
+        return None
+    if not cfg.managed or "pi" in cfg.agents:
+        return None
     master = get_master()
     if master is None or not master.is_dir():
         return None
     try:
-        rule_names = list_rules(master)
-        if not rule_names:
-            return None
-        rules, _, _ = resolve_selection(master, rule_names, [], [])
+        rules, _, _ = resolve_selection(master, cfg.rules, [], [])
         pi_rules = filter_rules_for_agent(rules, "pi")
-        block = render_rules_block(pi_rules, "Global rules (myai)")
+        block = render_rules_block(pi_rules, "Project rules (myai)")
         return block.strip() or None
     except Exception:
         return None

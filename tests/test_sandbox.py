@@ -5,6 +5,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from myai.agentsync.config import RepoConfig, save_config
+from myai.agentsync.registry import set_master
 from myai.sandbox.config import (
     DENY_ALL_SENTINEL,
     DEFAULT_MODEL_ENDPOINT,
@@ -52,6 +54,13 @@ from myai.sandbox.provision import (
     render_models_json,
     session_dir_name,
 )
+
+
+def _write_master_rule(master: Path, name: str, body: str) -> None:
+    """Write a minimal rule file under master/rules/."""
+    rules_dir = master / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    (rules_dir / f"{name}.md").write_text(body, encoding="utf-8")
 
 
 class SandboxTestCase(unittest.TestCase):
@@ -421,6 +430,51 @@ class ProvisionTests(SandboxTestCase):
             repo.mkdir()
             staging = prepare_agent_dir(repo, SandboxConfig())
             self.assertTrue((staging / "sessions").is_dir())
+
+    def test_prepare_agent_dir_skips_agents_md_when_unmanaged(self) -> None:
+        with TemporaryDirectory() as tmp:
+            master = Path(tmp) / "master"
+            master.mkdir()
+            _write_master_rule(master, "general", "General rule body for sandbox test\n")
+            set_master(master)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            self.assertFalse((staging / "AGENTS.md").exists())
+
+    def test_prepare_agent_dir_skips_agents_md_when_pi_managed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            master = Path(tmp) / "master"
+            master.mkdir()
+            _write_master_rule(master, "general", "General rule body for sandbox test\n")
+            set_master(master)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            save_config(
+                repo,
+                RepoConfig(agents=["cursor", "pi"], rules=["general"]),
+            )
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            self.assertFalse((staging / "AGENTS.md").exists())
+
+    def test_prepare_agent_dir_writes_agents_md_for_managed_non_pi(self) -> None:
+        with TemporaryDirectory() as tmp:
+            master = Path(tmp) / "master"
+            master.mkdir()
+            _write_master_rule(master, "general", "General rule body for sandbox test\n")
+            set_master(master)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            save_config(
+                repo,
+                RepoConfig(agents=["cursor"], rules=["general"]),
+            )
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            agents_md = staging / "AGENTS.md"
+            self.assertTrue(agents_md.is_file())
+            text = agents_md.read_text(encoding="utf-8")
+            self.assertIn("# Project rules (myai)", text)
+            self.assertIn("General rule body for sandbox test", text)
 
     def test_pi_launch_uses_workspace_path_in_cd(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -175,6 +175,10 @@ run. Override with `--host-loopback` / `--no-host-loopback` or
 `MYAI_HOST_LOOPBACK=1|0`. With `routes` empty, the legacy flat fields
 (`model_endpoint`, `guest_model_host`, `provider`, `model_id`) are used instead.
 
+### Rule injection 
+
+For myai-managed repos that do not target pi (see `.myai/config.json`), the sandbox flattens the repo's selected rules into `/root/.pi/agent/AGENTS.md` so guest `pi` still gets project rules. Unmanaged repos and repos with `pi` in `agents` get no injected file — pi-managed repos use the synced repo `AGENTS.md` from the workspace mount.
+
 ### Other knobs
 
 - `mirror_host_pi` / `--mirror-host-pi`: mirror host `~/.pi/agent/settings.json`

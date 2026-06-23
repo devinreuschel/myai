@@ -31,6 +31,21 @@ Capabilities are defined in `myai/agentsync/render.py` (`AGENT_CAPS`):
 
 Rules can be scoped per-agent via frontmatter `agents: [cursor, claude]`.
 
+### Sandbox rule injection
+
+When running `myai sandbox run`, guest `pi` reads global instructions from
+`/root/.pi/agent/AGENTS.md` (via `PI_CODING_AGENT_DIR`). Injection is gated on
+the repo's `.myai/config.json`:
+
+| Repo state | Injected `/root/.pi/agent/AGENTS.md` |
+|------------|--------------------------------------|
+| Not myai-managed (no config) | No |
+| Managed, `pi` in `agents` | No — use synced repo `AGENTS.md` in the workspace |
+| Managed, no `pi` in `agents` | Yes — repo's selected rules, filtered for pi |
+
+This lets cursor-only (or claude-only) managed repos run sandboxed `pi` with the
+same rule set without duplicating rules when the repo already syncs for pi.
+
 ## Agent sandbox: phasing and escape hatches
 
 We run interactive `pi` inside a microVM so it feels like plain `pi` but the
