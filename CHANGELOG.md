@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- myai-managed guardrail: when enabled (default), injects instructions not to edit synced rules/skills/subagents directly; cursor/claude get an always-apply rule (nested file or managed block), pi gets `.pi/APPEND_SYSTEM.md` via `myai sync`, non-pi managed repos also get `/root/.pi/agent/APPEND_SYSTEM.md` at VM boot
+- Global user settings in `~/.myai/config.json` (alongside `~/.myai/sandbox.json`); `inject_myai_rule` lives here
+- `myai config myai-rule [on|off]` to show or set the global default for the myai-managed guardrail
+- `myai init --no-myai-rule` to disable the guardrail for a repo (overrides the global default)
+- Per-repo `inject_myai_rule` in `.myai/config.json` (`null`/absent = inherit global default)
 - `myai sandbox` command: run `pi` inside a Gondolin micro-VM, with `run`, `provision`, `doctor`, `ls`, `stop`, `snapshot`, `register`, and `init` subcommands
 - Config via `.myai/sandbox.json` (repo) over `~/.myai/sandbox.json` (global), with `models.json` provisioning and `--tcp-map` host-loopback routes
 - One-time provisioning phase (`sandbox provision` or auto on first `run`): installs pi to a host-mounted `/opt/pi` prefix (avoids guest rootfs `ENOSPC`) and pre-fetches fd/ripgrep into persistent host caches; allows npm/github only during provisioning, not at runtime
@@ -28,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Global `inject_myai_rule` moved from `~/.local/share/myai/agentsync.json` to `~/.myai/config.json`; legacy registry values are read until the global config file exists or is written via `myai config myai-rule`
 - **Breaking:** `host_loopback.enabled` defaults to `false` (cloud-first). Configs with a flat `model_endpoint` but no `host_loopback` section no longer emit `--tcp-map` or inject `--provider myai-local`; add `"host_loopback": { "enabled": true }` or pass `--model-endpoint` / `--host-loopback`.
 - **Breaking:** runtime network is fail-closed. An empty allow list now denies all egress; allow hosts via `providers`/`allow_hosts` (+ loopback), or set `network_policy: "allow-all"` to opt out. github/npm stay allowed only in the provisioning VM.
 - Updated sandbox rule injection so that guest `/root/.pi/agent/AGENTS.md` is written only for myai-managed repos that do not target pi, using the repo's selected rules from `.myai/config.json`. Unmanaged repos and pi-managed repos get no injected file (pi-managed repos rely on the synced repo `AGENTS.md` in the workspace mount).

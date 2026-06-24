@@ -2,6 +2,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from myai.global_config import get_inject_myai_rule_default
+
 CONFIG_VERSION = 1
 MYAI_DIR = ".myai"
 CONFIG_FILE = "config.json"
@@ -25,6 +27,7 @@ class RepoConfig:
     skills: list[str] = field(default_factory=list)
     subagents: list[str] = field(default_factory=list)
     nested_rules: bool = True
+    inject_myai_rule: bool | None = None
 
     def validate(self) -> None:
         for agent in self.agents:
@@ -66,9 +69,17 @@ def load_config(repo: Path) -> RepoConfig:
         skills=list(data.get("skills", [])),
         subagents=list(data.get("subagents", [])),
         nested_rules=data.get("nested_rules", True),
+        inject_myai_rule=data.get("inject_myai_rule"),
     )
     cfg.validate()
     return cfg
+
+
+def resolve_inject_myai_rule(cfg: RepoConfig) -> bool:
+    """Per-repo override if set, else global default from ~/.myai/config.json."""
+    if cfg.inject_myai_rule is not None:
+        return cfg.inject_myai_rule
+    return get_inject_myai_rule_default()
 
 
 def save_config(repo: Path, cfg: RepoConfig) -> None:
@@ -84,6 +95,8 @@ def save_config(repo: Path, cfg: RepoConfig) -> None:
         "subagents": cfg.subagents,
         "nested_rules": cfg.nested_rules,
     }
+    if cfg.inject_myai_rule is not None:
+        data["inject_myai_rule"] = cfg.inject_myai_rule
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 

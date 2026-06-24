@@ -31,17 +31,45 @@ Capabilities are defined in `myai/agentsync/render.py` (`AGENT_CAPS`):
 
 Rules can be scoped per-agent via frontmatter `agents: [cursor, claude]`.
 
+### myai-managed guardrail
+
+Managed repos can inject a guardrail that tells agents not to edit myai-managed rules, skills, or subagents directly and to guide the user to change the master repo instead.
+
+Delivery differs by agent (cursor and claude have no synced system-prompt file):
+
+| Agent | Nested rules (`nested_rules: true`) | Flat rules |
+|-------|-------------------------------------|------------|
+| cursor | `.cursor/rules/myai-managed.mdc` (`alwaysApply: true`) | `## myai-managed` in `AGENTS.md` managed block |
+| claude | `.claude/rules/myai-managed.md` | `## myai-managed` in `CLAUDE.md` managed block |
+| pi | `.pi/APPEND_SYSTEM.md` (appended to system prompt, not a replacement) | same |
+
+Toggle resolution (default on):
+
+- Global default: `inject_myai_rule` in `~/.myai/config.json` (absent = true).
+  Set with `myai config myai-rule on|off`. Legacy values in `agentsync.json` are read once until the global config file exists or is written.
+- Per-repo override: `inject_myai_rule` in `.myai/config.json` (`null`/absent = inherit global). Set at init with `--no-myai-rule`.
+
+| Repo state | cursor / claude | pi |
+|------------|-----------------|-----|
+| Not myai-managed | Nowhere | Nowhere |
+| Managed, toggle off | Nowhere | Nowhere |
+| Managed, toggle on | Synced rule (nested or flat) | `.pi/APPEND_SYSTEM.md` via `myai sync` |
+| Managed, toggle on, no `pi` in `agents` (VM only) | — | `/root/.pi/agent/APPEND_SYSTEM.md` at VM boot |
+
+When the repo already syncs for pi, the VM does not inject its own copy; the synced project file is picked up from the workspace mount.
+
 ### Sandbox rule injection
 
 When running `myai sandbox run`, guest `pi` reads global instructions from
 `/root/.pi/agent/AGENTS.md` (via `PI_CODING_AGENT_DIR`). Injection is gated on
 the repo's `.myai/config.json`:
 
-| Repo state | Injected `/root/.pi/agent/AGENTS.md` |
-|------------|--------------------------------------|
-| Not myai-managed (no config) | No |
-| Managed, `pi` in `agents` | No — use synced repo `AGENTS.md` in the workspace |
-| Managed, no `pi` in `agents` | Yes — repo's selected rules, filtered for pi |
+| Repo state | Injected `/root/.pi/agent/AGENTS.md` | Injected `/root/.pi/agent/APPEND_SYSTEM.md` |
+|------------|--------------------------------------|---------------------------------------------|
+| Not myai-managed (no config) | No | No |
+| Managed, toggle off | No | No |
+| Managed, `pi` in `agents` | No — use synced repo `AGENTS.md` in the workspace | No — use synced `.pi/APPEND_SYSTEM.md` |
+| Managed, no `pi` in `agents` | Yes — repo's selected rules, filtered for pi | Yes — myai-managed guardrail |
 
 This lets cursor-only (or claude-only) managed repos run sandboxed `pi` with the
 same rule set without duplicating rules when the repo already syncs for pi.

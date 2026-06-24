@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from myai.agentsync.config import RepoConfig, save_config
 from myai.agentsync.registry import set_master
+from myai.agentsync.render import MYAI_MANAGED_RULE
+from myai.global_config import set_inject_myai_rule_default
 from myai.sandbox.config import (
     DENY_ALL_SENTINEL,
     DEFAULT_MODEL_ENDPOINT,
@@ -491,6 +493,100 @@ class ProvisionTests(SandboxTestCase):
             text = agents_md.read_text(encoding="utf-8")
             self.assertIn("# Project rules (myai)", text)
             self.assertIn("General rule body for sandbox test", text)
+
+    def test_prepare_agent_dir_writes_append_system_for_managed_non_pi(self) -> None:
+        with TemporaryDirectory() as tmp:
+            master = Path(tmp) / "master"
+            master.mkdir()
+            _write_master_rule(master, "general", "General rule body for sandbox test\n")
+            set_master(master)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            save_config(
+                repo,
+                RepoConfig(agents=["cursor"], rules=["general"]),
+            )
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            append = staging / "APPEND_SYSTEM.md"
+            self.assertTrue(append.is_file())
+            self.assertEqual(append.read_text(encoding="utf-8"), MYAI_MANAGED_RULE)
+
+    def test_prepare_agent_dir_skips_append_system_when_pi_managed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            master = Path(tmp) / "master"
+            master.mkdir()
+            set_master(master)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            save_config(
+                repo,
+                RepoConfig(agents=["cursor", "pi"], rules=["general"]),
+            )
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            self.assertFalse((staging / "APPEND_SYSTEM.md").exists())
+
+    def test_prepare_agent_dir_skips_append_system_when_unmanaged(self) -> None:
+        with TemporaryDirectory() as tmp:
+            master = Path(tmp) / "master"
+            master.mkdir()
+            set_master(master)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            staging = prepare_agent_dir(repo, SandboxConfig())
+            self.assertFalse((staging / "APPEND_SYSTEM.md").exists())
+
+    def test_prepare_agent_dir_skips_append_system_when_toggle_off(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / ".myai"
+            config_dir.mkdir()
+            old_home = os.environ.get("MYAI_HOME")
+            os.environ["MYAI_HOME"] = tmp
+            try:
+                with patch("myai.paths.global_myai_dir", return_value=config_dir):
+                    master = Path(tmp) / "master"
+                    master.mkdir()
+                    _write_master_rule(master, "general", "General rule body for sandbox test\n")
+                    set_master(master)
+                    set_inject_myai_rule_default(False)
+                    repo = Path(tmp) / "repo"
+                    repo.mkdir()
+                    save_config(
+                        repo,
+                        RepoConfig(agents=["cursor"], rules=["general"]),
+                    )
+                    staging = prepare_agent_dir(repo, SandboxConfig())
+                    self.assertFalse((staging / "APPEND_SYSTEM.md").exists())
+            finally:
+                if old_home is None:
+                    os.environ.pop("MYAI_HOME", None)
+                else:
+                    os.environ["MYAI_HOME"] = old_home
+
+    def test_prepare_agent_dir_respects_per_repo_override_off(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / ".myai"
+            config_dir.mkdir()
+            old_home = os.environ.get("MYAI_HOME")
+            os.environ["MYAI_HOME"] = tmp
+            try:
+                with patch("myai.paths.global_myai_dir", return_value=config_dir):
+                    master = Path(tmp) / "master"
+                    master.mkdir()
+                    set_master(master)
+                    set_inject_myai_rule_default(True)
+                    repo = Path(tmp) / "repo"
+                    repo.mkdir()
+                    save_config(
+                        repo,
+                        RepoConfig(agents=["cursor"], rules=["general"], inject_myai_rule=False),
+                    )
+                    staging = prepare_agent_dir(repo, SandboxConfig())
+                    self.assertFalse((staging / "APPEND_SYSTEM.md").exists())
+            finally:
+                if old_home is None:
+                    os.environ.pop("MYAI_HOME", None)
+                else:
+                    os.environ["MYAI_HOME"] = old_home
 
     def test_pi_launch_uses_workspace_path_in_cd(self) -> None:
         with TemporaryDirectory() as tmp:

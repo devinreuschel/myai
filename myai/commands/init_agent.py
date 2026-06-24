@@ -56,6 +56,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Flatten rules into AGENTS.md/CLAUDE.md instead of nested rule files",
     )
     parser.add_argument(
+        "--no-myai-rule",
+        action="store_true",
+        help="Disable the myai-managed guardrail for this repo (overrides global default)",
+    )
+    parser.add_argument(
         "--path",
         default=".",
         help="Repo path (default: cwd)",
@@ -97,6 +102,7 @@ def run(args: argparse.Namespace) -> int:
         skills=args.skills or [],
         subagents=args.subagents or [],
         nested_rules=not args.flat_rules,
+        inject_myai_rule=False if args.no_myai_rule else None,
     )
     save_config(repo, cfg)
     add_repo(repo)

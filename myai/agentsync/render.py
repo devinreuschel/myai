@@ -5,11 +5,27 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from myai.agentsync.master import Rule, Skill, Subagent, filter_rules_for_agent
+from myai.agentsync.master import Frontmatter, Rule, Skill, Subagent, filter_rules_for_agent
 
 BLOCK_BEGIN = "<!-- myai:begin -->"
 BLOCK_END = "<!-- myai:end -->"
 BLOCK_HEADER = "<!-- managed by myai; edit rules in the master repo -->"
+
+MYAI_APPEND_SYSTEM_REL = ".pi/APPEND_SYSTEM.md"
+
+MYAI_MANAGED_RULE_BODY = """\
+This project's agent rules, skills, and subagents are managed by myai and synced
+from a master repo. Do NOT edit them directly here (AGENTS.md managed blocks,
+.cursor/rules, .claude/rules, .pi/skills, .cursor/skills, .claude/skills,
+.claude/agents). myai sync overwrites them, so local edits are lost.
+
+If the user wants to change a rule, skill, or subagent: don't touch the managed
+files. Explain they're myai-managed and must change in the master repo, then walk
+them through it: edit the source under the master's rules/, skills/, or
+subagents/, then run `myai sync`. The master repo path is in the myai registry.
+"""
+
+MYAI_MANAGED_RULE = f"# myai-managed resources\n\n{MYAI_MANAGED_RULE_BODY}"
 
 
 @dataclass
@@ -186,6 +202,21 @@ def _merge_rules(existing: list[Rule], incoming: list[Rule]) -> list[Rule]:
     return merged
 
 
+def _myai_guardrail_rule() -> Rule:
+    fm = Frontmatter(
+        raw={
+            "description": "myai-managed resources; do not edit synced files directly",
+            "alwaysApply": True,
+        }
+    )
+    return Rule(
+        name="myai-managed",
+        path=Path("myai-managed"),
+        frontmatter=fm,
+        body=MYAI_MANAGED_RULE_BODY,
+    )
+
+
 def _add_nested_rules(
     plan: RenderPlan,
     rules: list[Rule],
@@ -209,11 +240,13 @@ def build_plan(
     skills: list[Skill],
     subagents: list[Subagent],
     nested_rules: bool = True,
+    inject_myai_rule: bool = False,
 ) -> RenderPlan:
     """Build the render plan for a repo sync."""
     del repo  # reserved for future repo-specific rendering
     plan = RenderPlan()
     flat_rules: dict[str, list[Rule]] = {}
+    guardrail = _myai_guardrail_rule() if inject_myai_rule else None
 
     for agent in agents:
         caps = AGENT_CAPS.get(agent)
@@ -221,6 +254,8 @@ def build_plan(
             continue
 
         agent_rules = filter_rules_for_agent(rules, agent)
+        if guardrail is not None and agent != "pi":
+            agent_rules = [*agent_rules, guardrail]
         use_nested = caps.supports_nested and nested_rules
 
         if use_nested:
@@ -248,6 +283,12 @@ def build_plan(
         block = render_rules_block(target_rules, "Project rules (myai)")
         if block:
             plan.blocks[target] = block
+
+    if inject_myai_rule and "pi" in agents:
+        plan.files[MYAI_APPEND_SYSTEM_REL] = RenderedFile(
+            rel_path=MYAI_APPEND_SYSTEM_REL,
+            content=MYAI_MANAGED_RULE,
+        )
 
     return plan
 

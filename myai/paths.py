@@ -44,3 +44,7 @@ def global_sandbox_config_path() -> Path | None:
 
 def global_sandbox_config_write_path() -> Path:
     return global_myai_dir() / "sandbox.json"
+
+
+def global_config_path() -> Path:
+    return global_myai_dir() / "config.json"

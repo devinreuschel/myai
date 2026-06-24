@@ -4,10 +4,10 @@ import os
 import shutil
 from pathlib import Path
 
-from myai.agentsync.config import ConfigError, load_config
+from myai.agentsync.config import ConfigError, load_config, resolve_inject_myai_rule
 from myai.agentsync.master import filter_rules_for_agent, resolve_selection
 from myai.agentsync.registry import get_master
-from myai.agentsync.render import render_rules_block
+from myai.agentsync.render import MYAI_MANAGED_RULE, render_rules_block
 from myai.paths import sandbox_root
 from myai.sandbox.config import (
     DEFAULT_IMAGE,
@@ -100,6 +100,9 @@ def prepare_agent_dir(repo: Path, cfg: SandboxConfig, *, debug: bool = False) ->
     system_md = render_global_system_md()
     if system_md:
         (staging / "SYSTEM.md").write_text(system_md, encoding="utf-8")
+    append_system = render_myai_append_system(repo)
+    if append_system:
+        (staging / "APPEND_SYSTEM.md").write_text(append_system, encoding="utf-8")
     # sessions/ is a placeholder; when share_host_sessions is on the sidecar
     # overlays host ~/.pi/agent/sessions at GUEST_AGENT_PATH/sessions. A host
     # symlink does not work: RealFSProvider cannot follow targets outside the
@@ -280,6 +283,23 @@ def render_agents_md(repo: Path) -> str | None:
         return block.strip() or None
     except Exception:
         return None
+
+
+def render_myai_append_system(repo: Path) -> str | None:
+    """Inject the myai-managed guardrail into pi's system prompt for sandbox runs.
+
+    Only managed repos that don't already target pi get this in the guest agent
+    dir; pi-targeting repos receive it via sync into .pi/APPEND_SYSTEM.md.
+    """
+    try:
+        cfg = load_config(repo)
+    except ConfigError:
+        return None
+    if not cfg.managed or "pi" in cfg.agents:
+        return None
+    if not resolve_inject_myai_rule(cfg):
+        return None
+    return MYAI_MANAGED_RULE
 
 
 def render_global_system_md() -> str | None:

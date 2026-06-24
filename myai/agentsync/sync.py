@@ -3,7 +3,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from myai.agentsync.config import RepoConfig, RepoState, load_config, load_state, save_state
+from myai.agentsync.config import (
+    RepoConfig,
+    RepoState,
+    load_config,
+    load_state,
+    resolve_inject_myai_rule,
+    save_state,
+)
 from myai.agentsync.master import MasterError, resolve_selection
 from myai.agentsync.render import (
     RenderPlan,
@@ -59,7 +66,15 @@ def compute_sync(repo: Path, cfg: RepoConfig, old_state: RepoState) -> SyncPlan:
     rules, skills, subagents = resolve_selection(
         master, cfg.rules, cfg.skills, cfg.subagents
     )
-    plan = build_plan(repo, cfg.agents, rules, skills, subagents, cfg.nested_rules)
+    plan = build_plan(
+        repo,
+        cfg.agents,
+        rules,
+        skills,
+        subagents,
+        cfg.nested_rules,
+        inject_myai_rule=resolve_inject_myai_rule(cfg),
+    )
 
     actions: list[SyncAction] = []
     new_state = RepoState(files={}, blocks={})
