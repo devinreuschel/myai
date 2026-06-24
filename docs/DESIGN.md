@@ -55,15 +55,27 @@ account, real microVM isolation, and a true bidirectional PTY (raw stdin,
 stdout/stderr, resize). The PTY requirement is the decisive criterion and rules
 out most exec-only sandbox SDKs.
 
-### Phase 2 (if the CLI flag surface is limiting): Node sidecar
+### Phase 1 (done): Gondolin CLI wrapper
 
-A specific missing Gondolin capability (custom VFS provider, dynamic per-request
-network policy, programmatic ingress) that the CLI doesn't expose. Write a small
-`.mjs` that imports `@earendil-works/gondolin`, encodes our policy via
-`VM.create()`, and exposes a narrow stdio/JSON-RPC interface our Python CLI
-calls. Keeps the tool in Python while unlocking the full SDK. Cost: we bundle and
-maintain a Node helper + `node_modules` and a host<->sidecar protocol; still a
-Node runtime dependency.
+Python built `gondolin bash` argv with `--mount-hostfs`, `--allow-host`, etc.
+Whole-repo bind mounts exposed project `.myai/` to the guest.
+
+### Phase 2 (done): Node sidecar + SDK VFS
+
+Implemented in `myai/sandbox/sidecar/`. Python builds a JSON VM spec; a small
+Node sidecar imports `@earendil-works/gondolin`, calls `VM.create()` with
+programmable VFS mounts, and runs `vm.shell({ attach: true })` for the
+interactive pi session.
+
+The workspace mount uses `ShadowProvider` + `createShadowPathPredicate` to hide
+and deny guest access to configured paths (default: `/.myai`). Host-side sandbox
+config (`.myai/sandbox.json`) is read only on the host before boot; the guest
+never needs the repo-level `.myai/` directory.
+
+Each `sandbox run` cold-boots a fresh VM that exits when pi exits. Pi session
+history still persists via the host-backed `~/.pi/agent/sessions` mount
+(`share_host_sessions`, default true), so `pi --resume <id>` works on the host or
+via `myai sandbox run -- --resume <id>`.
 
 ### Phase 3 (if the Node dependency itself is the problem): Python-native swap
 

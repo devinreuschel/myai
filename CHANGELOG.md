@@ -22,12 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `auto_approve` (default true) / `--no-auto-approve`: pi auto-approves tool calls inside the sandbox; disable to require approval
 - `--debug`: report executables the guest tried to run but couldn't find
 - `rootfs_size` / `--rootfs-size` to grow the guest root disk (needs `e2fsprogs` in the image)
+- Gondolin SDK sidecar (`myai/sandbox/sidecar/`): Python builds a JSON VM spec; Node drives `VM.create()` with programmable VFS and `vm.shell({ attach: true })`
+- `guest_hidden_paths` (default `["/.myai"]`) and `--hide`: hide and deny workspace paths in the guest via `ShadowProvider`
+- Sidecar npm install cache under `$MYAI_HOME/sandbox/sidecar/`; `doctor` checks npm + sidecar
 
 ### Changed
 
 - **Breaking:** `host_loopback.enabled` defaults to `false` (cloud-first). Configs with a flat `model_endpoint` but no `host_loopback` section no longer emit `--tcp-map` or inject `--provider myai-local`; add `"host_loopback": { "enabled": true }` or pass `--model-endpoint` / `--host-loopback`.
 - **Breaking:** runtime network is fail-closed. An empty allow list now denies all egress; allow hosts via `providers`/`allow_hosts` (+ loopback), or set `network_policy: "allow-all"` to opt out. github/npm stay allowed only in the provisioning VM.
 - Updated sandbox rule injection so that guest `/root/.pi/agent/AGENTS.md` is written only for myai-managed repos that do not target pi, using the repo's selected rules from `.myai/config.json`. Unmanaged repos and pi-managed repos get no injected file (pi-managed repos rely on the synced repo `AGENTS.md` in the workspace mount).
+- **Breaking:** sandbox no longer shells out to `npx @earendil-works/gondolin`; it uses the pinned SDK sidecar (`gondolin_version` default `0.12.0`)
+- **Breaking:** removed warm VM reuse subcommands (`ls`, `stop`, `snapshot`, `register`) and `warm_reuse` config; each run cold-boots and exits with pi
+- **Breaking:** `doctor` checks `npm` instead of `npx`
 
 ## [0.1.0] - 2026-06-21
 

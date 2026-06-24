@@ -1,6 +1,7 @@
 # myai pi sandbox image
 
-Custom Gondolin guest image with Node.js and pi preinstalled.
+Custom Gondolin guest image with Node.js and pi preinstalled. Runtime VM control
+uses the myai Gondolin SDK sidecar (not the `gondolin` CLI).
 
 Generate a default Gondolin build config, then customize packages:
 

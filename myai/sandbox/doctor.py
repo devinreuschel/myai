@@ -6,6 +6,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from myai.sandbox.config import SandboxConfig, sidecar_install_dir
+from myai.sandbox.sidecar_install import is_sidecar_installed
+
 
 MIN_NODE_MAJOR = 23
 MIN_NODE_MINOR = 6
@@ -20,20 +23,23 @@ class CheckResult:
     fix: str = ""
 
 
-def run_doctor() -> list[CheckResult]:
+def run_doctor(cfg: SandboxConfig | None = None) -> list[CheckResult]:
+    """Run sandbox prerequisite checks."""
+    cfg = cfg or SandboxConfig()
     return [
         _check_node(),
-        _check_npx(),
+        _check_npm(),
         _check_qemu(),
         _check_krun(),
         _check_virtualization(),
         _check_gondolin_cache(),
+        _check_sidecar(cfg),
         _check_disk_space(),
     ]
 
 
 def doctor_ok(results: list[CheckResult]) -> bool:
-    required = {"node", "npx", "qemu", "virtualization", "disk"}
+    required = {"node", "npm", "qemu", "virtualization", "disk"}
     for result in results:
         if result.name in required and not result.ok:
             return False
@@ -79,11 +85,11 @@ def _check_node() -> CheckResult:
         return CheckResult("node", False, str(exc), "install Node.js >= 23.6")
 
 
-def _check_npx() -> CheckResult:
-    npx = shutil.which("npx")
-    if not npx:
-        return CheckResult("npx", False, "npx not found", "install Node.js/npm (npx ships with npm)")
-    return CheckResult("npx", True, npx)
+def _check_npm() -> CheckResult:
+    npm = shutil.which("npm")
+    if not npm:
+        return CheckResult("npm", False, "npm not found", "install Node.js/npm")
+    return CheckResult("npm", True, npm)
 
 
 def _qemu_binary() -> str:
@@ -141,13 +147,23 @@ def _check_virtualization() -> CheckResult:
 
 def _check_gondolin_cache() -> CheckResult:
     cache = Path.home() / ".cache" / "gondolin" / "images"
-    sessions = Path.home() / ".cache" / "gondolin" / "sessions"
     if cache.is_dir() and any(cache.iterdir()):
         return CheckResult("gondolin_assets", True, f"cached images in {cache}")
     return CheckResult(
         "gondolin_assets",
         True,
         f"no cached images yet (first run downloads ~200MB to {cache})",
+    )
+
+
+def _check_sidecar(cfg: SandboxConfig) -> CheckResult:
+    install = sidecar_install_dir()
+    if is_sidecar_installed(cfg):
+        return CheckResult("sidecar", True, f"Gondolin SDK installed in {install}")
+    return CheckResult(
+        "sidecar",
+        True,
+        f"not installed yet (first run runs npm install in {install})",
     )
 
 
@@ -171,7 +187,7 @@ def _check_disk_space() -> CheckResult:
 def failure_message(results: list[CheckResult]) -> str:
     lines = ["sandbox prerequisites not met:"]
     for result in results:
-        if not result.ok and result.name in {"node", "npx", "qemu", "virtualization", "disk"}:
+        if not result.ok and result.name in {"node", "npm", "qemu", "virtualization", "disk"}:
             lines.append(f"  - {result.name}: {result.detail}")
             if result.fix:
                 lines.append(f"    {result.fix}")

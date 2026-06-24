@@ -100,6 +100,10 @@ def prepare_agent_dir(repo: Path, cfg: SandboxConfig, *, debug: bool = False) ->
     system_md = render_global_system_md()
     if system_md:
         (staging / "SYSTEM.md").write_text(system_md, encoding="utf-8")
+    # sessions/ is a placeholder; when share_host_sessions is on the sidecar
+    # overlays host ~/.pi/agent/sessions at GUEST_AGENT_PATH/sessions. A host
+    # symlink does not work: RealFSProvider cannot follow targets outside the
+    # staging mount root, so guest mkdir fails with ENOENT.
     (staging / "sessions").mkdir(exist_ok=True)
     if debug:
         _write_debug_init(staging)
@@ -290,8 +294,7 @@ def render_global_system_md() -> str | None:
 
 def guest_agent_env(cfg: SandboxConfig, *, debug: bool = False) -> list[str]:
     env = [f"PI_CODING_AGENT_DIR={GUEST_AGENT_PATH}"]
-    # forward TERM so the guest pi TUI uses cursor addressing / alt screen instead
-    # of reprinting whole frames into scrollback
+    # forward TERM so the guest matches the real terminal for color/capability detection
     env.append(f"TERM={os.environ.get('TERM') or 'xterm-256color'}")
     if cfg.llama_server_url:
         url = cfg.llama_server_url

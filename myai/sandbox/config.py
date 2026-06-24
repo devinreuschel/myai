@@ -14,7 +14,8 @@ SANDBOX_CONFIG_FILE = "sandbox.json"
 DEFAULT_MODEL_ENDPOINT = "http://localhost:8080/v1"
 DEFAULT_GUEST_MODEL_HOST = "model.host"
 DEFAULT_GONDOLIN_PACKAGE = "@earendil-works/gondolin"
-DEFAULT_GONDOLIN_VERSION = "latest"
+DEFAULT_GONDOLIN_VERSION = "0.12.0"
+DEFAULT_GUEST_HIDDEN_PATHS = ("/.myai",)
 DEFAULT_IMAGE = "alpine-base:latest"
 DEFAULT_PROVIDER = "myai-local"
 DEFAULT_MODEL_ID = "local"
@@ -135,8 +136,9 @@ class SandboxConfig:
     image: str = DEFAULT_IMAGE
     rootfs_size: str | None = None
     vmm: str = "auto"
-    warm_reuse: bool = True
     mount_readonly: bool = False
+    # workspace-relative paths hidden from the guest (ShadowProvider deny+hide)
+    guest_hidden_paths: list[str] = field(default_factory=lambda: list(DEFAULT_GUEST_HIDDEN_PATHS))
     install_pi_at_boot: bool = True
     pi_package: str = "@earendil-works/pi-coding-agent"
     mirror_host_pi: bool = False
@@ -172,6 +174,11 @@ class SandboxConfig:
             raise SandboxConfigError(
                 f"invalid rootfs_size {self.rootfs_size!r}; use a size like 4G or 512M"
             )
+        for path in self.guest_hidden_paths:
+            if not path.startswith("/"):
+                raise SandboxConfigError(
+                    f"guest_hidden_paths entries must be absolute workspace paths, got {path!r}"
+                )
         self.host_loopback.validate()
         for secret in self.host_secrets:
             secret.validate()
@@ -385,8 +392,8 @@ def _config_from_dict(data: dict) -> SandboxConfig:
         image=data.get("image", DEFAULT_IMAGE),
         rootfs_size=data.get("rootfs_size"),
         vmm=data.get("vmm", "auto"),
-        warm_reuse=data.get("warm_reuse", True),
         mount_readonly=data.get("mount_readonly", False),
+        guest_hidden_paths=list(data.get("guest_hidden_paths", DEFAULT_GUEST_HIDDEN_PATHS)),
         install_pi_at_boot=data.get("install_pi_at_boot", True),
         pi_package=data.get("pi_package", "@earendil-works/pi-coding-agent"),
         mirror_host_pi=data.get("mirror_host_pi", False),
@@ -493,8 +500,8 @@ def _config_to_dict(cfg: SandboxConfig) -> dict:
         "image": cfg.image,
         **({"rootfs_size": cfg.rootfs_size} if cfg.rootfs_size else {}),
         "vmm": cfg.vmm,
-        "warm_reuse": cfg.warm_reuse,
         "mount_readonly": cfg.mount_readonly,
+        "guest_hidden_paths": cfg.guest_hidden_paths,
         "install_pi_at_boot": cfg.install_pi_at_boot,
         "pi_package": cfg.pi_package,
         "mirror_host_pi": cfg.mirror_host_pi,
@@ -610,11 +617,30 @@ def effective_workspace_path(repo: Path, cfg: SandboxConfig) -> str:
     return str(repo.resolve())
 
 
-def gondolin_invocation(cfg: SandboxConfig) -> list[str]:
+def sidecar_source_dir() -> Path:
+    """Bundled Node sidecar sources shipped with the Python package."""
+    return Path(__file__).resolve().parent / "sidecar"
+
+
+def sidecar_install_dir() -> Path:
+    """Host cache dir where npm installs the Gondolin SDK for the sidecar."""
+    return sandbox_root() / "sidecar"
+
+
+def gondolin_package_spec(cfg: SandboxConfig) -> str:
+    """npm package spec for the pinned Gondolin SDK."""
     pkg = cfg.gondolin_package
-    if cfg.gondolin_version and cfg.gondolin_version != "latest":
-        pkg = f"{pkg}@{cfg.gondolin_version}"
-    return ["npx", "--yes", pkg]
+    version = cfg.gondolin_version
+    if version and version != "latest":
+        return f"{pkg}@{version}"
+    return pkg
+
+
+def sidecar_invocation(cfg: SandboxConfig) -> list[str]:
+    """Argv prefix to run the Node Gondolin sidecar."""
+    install = sidecar_install_dir()
+    script = install / "sidecar.mjs"
+    return ["node", str(script)]
 
 
 def default_sandbox_config() -> SandboxConfig:

@@ -24,7 +24,8 @@ from myai.sandbox.config import (
     effective_allow_hosts,
     effective_rootfs_size,
     effective_workspace_path,
-    gondolin_invocation,
+    gondolin_package_spec,
+    sidecar_invocation,
     host_sessions_dir,
     load_config,
     provision_allow_hosts,
@@ -118,10 +119,9 @@ class ConfigTests(SandboxTestCase):
     def test_repo_config_roundtrip(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            cfg = SandboxConfig(model_endpoint="http://localhost:8080/v1", warm_reuse=False)
+            cfg = SandboxConfig(model_endpoint="http://localhost:8080/v1")
             save_repo_config(repo, cfg)
             loaded = load_config(repo)
-            self.assertFalse(loaded.warm_reuse)
             self.assertEqual(loaded.model_endpoint, "http://localhost:8080/v1")
             self.assertFalse(loaded.host_loopback.enabled)
 
@@ -162,12 +162,28 @@ class ConfigTests(SandboxTestCase):
             cfg = SandboxConfig(guest_repo_mount="workspace")
             self.assertEqual(effective_workspace_path(repo, cfg), WORKSPACE_PATH)
 
-    def test_gondolin_invocation_pin(self) -> None:
-        cfg = SandboxConfig(gondolin_version="1.2.3")
-        self.assertEqual(
-            gondolin_invocation(cfg),
-            ["npx", "--yes", "@earendil-works/gondolin@1.2.3"],
-        )
+    def test_default_guest_hidden_paths(self) -> None:
+        cfg = default_sandbox_config()
+        self.assertEqual(cfg.guest_hidden_paths, ["/.myai"])
+
+    def test_guest_hidden_paths_roundtrip(self) -> None:
+        cfg = SandboxConfig(guest_hidden_paths=["/.myai", "/.env"])
+        loaded = _config_from_dict(_config_to_dict(cfg))
+        self.assertEqual(loaded.guest_hidden_paths, ["/.myai", "/.env"])
+
+    def test_invalid_guest_hidden_path(self) -> None:
+        with self.assertRaises(SandboxConfigError):
+            SandboxConfig(guest_hidden_paths=[".myai"]).validate()
+
+    def test_sidecar_invocation(self) -> None:
+        cfg = SandboxConfig(gondolin_version="0.12.0")
+        cmd = sidecar_invocation(cfg)
+        self.assertEqual(cmd[0], "node")
+        self.assertTrue(cmd[1].endswith("sidecar.mjs"))
+
+    def test_gondolin_package_spec_pin(self) -> None:
+        cfg = SandboxConfig(gondolin_version="0.12.0")
+        self.assertEqual(gondolin_package_spec(cfg), "@earendil-works/gondolin@0.12.0")
 
     def test_enabled_without_routes_requires_legacy_synthesis(self) -> None:
         cfg = _loopback_cfg()
@@ -493,36 +509,61 @@ class ProvisionTests(SandboxTestCase):
         self.assertIn("local", args)
 
 
-class GondolinPlanTests(SandboxTestCase):
-    def test_build_run_plan_no_tcp_map_when_disabled(self) -> None:
+class VmSpecTests(SandboxTestCase):
+    def _plan_spec(self, repo: Path, cfg: SandboxConfig, pi_args: list[str] | None = None):
+        plan = build_run_plan(repo, cfg, pi_args or [])
+        try:
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            return plan, data
+        finally:
+            plan.spec_path.unlink(missing_ok=True)
+
+    def _provision_spec(self, repo: Path, cfg: SandboxConfig):
+        plan = build_provision_plan(repo, cfg)
+        try:
+            return plan, json.loads(plan.spec_path.read_text(encoding="utf-8"))
+        finally:
+            plan.spec_path.unlink(missing_ok=True)
+
+    def test_build_run_plan_sidecar_argv(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=False)
-            plan = build_run_plan(repo, cfg, ["-p", "hello"])
-            self.assertIn("bash", plan.cmd)
-            mount_idx = plan.cmd.index("--mount-hostfs")
-            self.assertTrue(plan.cmd[mount_idx + 1].endswith(f":{repo.resolve()}"))
-            cwd_idx = plan.cmd.index("--cwd")
-            self.assertEqual(plan.cmd[cwd_idx + 1], str(repo.resolve()))
-            self.assertNotIn("--tcp-map", plan.cmd)
-            dash = plan.cmd.index("--")
-            self.assertEqual(plan.cmd[dash + 1], "pi")
-            self.assertIn("-a", plan.cmd[dash + 2 :])
-            self.assertNotIn("--provider", plan.cmd[dash + 2 :])
+            plan, _ = self._plan_spec(repo, cfg, ["-p", "hello"])
+            self.assertEqual(plan.cmd[0], "node")
+            self.assertTrue(plan.cmd[1].endswith("sidecar.mjs"))
+            self.assertEqual(plan.mode, "run")
 
-    def test_build_run_plan_legacy_loopback(self) -> None:
+    def test_build_run_spec_hides_myai(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(install_pi_at_boot=False)
+            _, data = self._plan_spec(repo, cfg, [])
+            self.assertIn("/.myai", data["vfs"]["workspace"]["hiddenPaths"])
+
+    def test_build_run_spec_no_tcp_map_when_disabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(install_pi_at_boot=False)
+            _, data = self._plan_spec(repo, cfg, ["-p", "hello"])
+            self.assertEqual(data["cwd"], str(repo.resolve()))
+            self.assertEqual(data["network"]["tcpHosts"], {})
+            self.assertEqual(data["command"][0], "pi")
+            self.assertIn("-a", data["command"])
+
+    def test_build_run_spec_legacy_loopback(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = _loopback_cfg(install_pi_at_boot=False)
-            plan = build_run_plan(repo, cfg, ["-p", "hello"])
-            self.assertIn("--tcp-map", plan.cmd)
-            self.assertIn("model.host:8080=127.0.0.1:8080", plan.cmd)
-            self.assertIn("--env", plan.cmd)
-            self.assertIn("PI_CODING_AGENT_DIR=/root/.pi/agent", plan.cmd)
-            dash = plan.cmd.index("--")
-            self.assertIn("--provider", plan.cmd[dash + 2 :])
+            _, data = self._plan_spec(repo, cfg, ["-p", "hello"])
+            self.assertEqual(
+                data["network"]["tcpHosts"],
+                {"model.host:8080": "127.0.0.1:8080"},
+            )
+            self.assertEqual(data["env"]["PI_CODING_AGENT_DIR"], GUEST_AGENT_PATH)
+            self.assertIn("--provider", data["command"])
 
-    def test_build_run_plan_multi_route(self) -> None:
+    def test_build_run_spec_multi_route(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = _loopback_cfg(
@@ -544,33 +585,30 @@ class GondolinPlanTests(SandboxTestCase):
                     ],
                 ),
             )
-            plan = build_run_plan(repo, cfg, [])
-            tcp_maps = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--tcp-map"
-            ]
+            _, data = self._plan_spec(repo, cfg, [])
             self.assertEqual(
-                tcp_maps,
-                ["model.host:8080=127.0.0.1:8080", "mcp.host:6277=127.0.0.1:6277"],
+                data["network"]["tcpHosts"],
+                {
+                    "model.host:8080": "127.0.0.1:8080",
+                    "mcp.host:6277": "127.0.0.1:6277",
+                },
             )
 
-    def test_host_secret_flag(self) -> None:
+    def test_host_secret_in_spec_not_argv(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            from myai.sandbox.config import HostSecret
-
             cfg = SandboxConfig(
                 install_pi_at_boot=False,
                 host_secrets=[HostSecret(name="OPENAI_API_KEY", hosts=["api.openai.com"])],
             )
             os.environ["OPENAI_API_KEY"] = "sk-test"
             try:
-                plan = build_run_plan(repo, cfg, [])
+                plan, data = self._plan_spec(repo, cfg, [])
             finally:
                 os.environ.pop("OPENAI_API_KEY", None)
-            self.assertIn("--host-secret", plan.cmd)
-            self.assertIn("OPENAI_API_KEY@api.openai.com", plan.cmd)
+            self.assertIn("OPENAI_API_KEY", data["network"]["secrets"])
+            self.assertNotIn("sk-test", " ".join(plan.cmd))
+            self.assertEqual(plan.env["OPENAI_API_KEY"], "sk-test")
 
     def test_effective_allow_hosts_disabled(self) -> None:
         cfg = SandboxConfig(allow_hosts=["api.github.com"], install_pi_at_boot=False)
@@ -610,109 +648,97 @@ class GondolinPlanTests(SandboxTestCase):
         cfg = SandboxConfig(rootfs_size="8G", install_pi_at_boot=False)
         self.assertEqual(effective_rootfs_size(cfg), "8G")
 
-    def test_build_run_plan_rootfs_size_when_explicit(self) -> None:
+    def test_build_run_spec_rootfs_size_when_explicit(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(rootfs_size="4G", install_pi_at_boot=True, image="alpine-base:latest")
-            plan = build_run_plan(repo, cfg, [])
-            idx = plan.cmd.index("--rootfs-size")
-            self.assertEqual(plan.cmd[idx + 1], "4G")
+            _, data = self._plan_spec(repo, cfg, [])
+            self.assertEqual(data["rootfsSize"], "4G")
 
-    def test_build_run_plan_pi_install_mount(self) -> None:
+    def test_build_run_spec_pi_install_mount(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=True, image="alpine-base:latest")
-            plan = build_run_plan(repo, cfg, [])
-            mounts = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--mount-hostfs"
-            ]
-            self.assertTrue(any(m.endswith(":/opt/pi") for m in mounts))
-            self.assertTrue(any(m.endswith(f":{GUEST_AGENT_PATH}/bin") for m in mounts))
-            self.assertNotIn("--rootfs-size", plan.cmd)
+            _, data = self._plan_spec(repo, cfg, [])
+            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
+            self.assertIn("/opt/pi", guest_paths)
+            self.assertIn(f"{GUEST_AGENT_PATH}/bin", guest_paths)
+            self.assertIsNone(data["rootfsSize"])
 
-    def test_build_run_plan_runtime_no_github_allow(self) -> None:
+    def test_build_run_spec_runtime_no_github_allow(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=True, image="alpine-base:latest")
-            plan = build_run_plan(repo, cfg, [])
-            allow_hosts = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--allow-host"
-            ]
-            self.assertNotIn("github.com", allow_hosts)
-            self.assertNotIn("registry.npmjs.org", allow_hosts)
+            _, data = self._plan_spec(repo, cfg, [])
+            allow = data["network"]["allowedHosts"]
+            self.assertNotIn("github.com", allow)
+            self.assertNotIn("registry.npmjs.org", allow)
 
-    def test_build_provision_plan_allows_github(self) -> None:
+    def test_build_provision_spec_allows_github(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=True, image="alpine-base:latest")
-            plan = build_provision_plan(repo, cfg)
-            allow_hosts = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--allow-host"
-            ]
-            self.assertIn("github.com", allow_hosts)
-            self.assertIn("registry.npmjs.org", allow_hosts)
-            self.assertNotIn("--tcp-map", plan.cmd)
+            _, data = self._provision_spec(repo, cfg)
+            allow = data["network"]["allowedHosts"]
+            self.assertIn("github.com", allow)
+            self.assertIn("registry.npmjs.org", allow)
+            self.assertEqual(data["network"]["tcpHosts"], {})
 
-    def test_build_run_plan_mirror_pkg_mounts(self) -> None:
+    def test_build_run_spec_mirror_pkg_mounts(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=True, image="alpine-base:latest", mirror_host_pi=True)
-            plan = build_run_plan(repo, cfg, [])
-            mounts = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--mount-hostfs"
-            ]
-            self.assertTrue(any(m.endswith(f":{GUEST_AGENT_PATH}/npm") for m in mounts))
-            self.assertTrue(any(m.endswith(f":{GUEST_AGENT_PATH}/git") for m in mounts))
+            _, data = self._plan_spec(repo, cfg, [])
+            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
+            self.assertIn(f"{GUEST_AGENT_PATH}/npm", guest_paths)
+            self.assertIn(f"{GUEST_AGENT_PATH}/git", guest_paths)
 
-    def test_build_run_plan_no_rootfs_size_by_default(self) -> None:
+    def test_build_run_spec_no_rootfs_size_by_default(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=False, image="alpine-base:latest")
-            plan = build_run_plan(repo, cfg, [])
-            self.assertNotIn("--rootfs-size", plan.cmd)
+            _, data = self._plan_spec(repo, cfg, [])
+            self.assertIsNone(data["rootfsSize"])
 
-    def test_build_run_plan_workspace_mount_mode(self) -> None:
+    def test_build_run_spec_workspace_mount_mode(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(guest_repo_mount="workspace", install_pi_at_boot=False)
-            plan = build_run_plan(repo, cfg, [])
-            mount = plan.cmd[plan.cmd.index("--mount-hostfs") + 1]
-            self.assertTrue(mount.endswith(":/workspace"))
-            cwd_idx = plan.cmd.index("--cwd")
-            self.assertEqual(plan.cmd[cwd_idx + 1], WORKSPACE_PATH)
+            _, data = self._plan_spec(repo, cfg, [])
+            self.assertEqual(data["vfs"]["workspace"]["guestPath"], WORKSPACE_PATH)
+            self.assertEqual(data["cwd"], WORKSPACE_PATH)
 
-    def test_build_run_plan_shares_host_sessions(self) -> None:
+    def test_build_run_spec_sessions_mount_when_shared(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(share_host_sessions=True, install_pi_at_boot=False)
-            plan = build_run_plan(repo, cfg, [])
-            mounts = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--mount-hostfs"
-            ]
-            expected = f"{host_sessions_dir().resolve()}:{GUEST_AGENT_PATH}/sessions"
-            self.assertIn(expected, mounts)
+            _, data = self._plan_spec(repo, cfg, [])
+            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
+            self.assertIn(f"{GUEST_AGENT_PATH}/sessions", guest_paths)
+            sessions_mount = next(
+                m for m in data["vfs"]["mounts"] if m["guestPath"] == f"{GUEST_AGENT_PATH}/sessions"
+            )
+            self.assertEqual(
+                sessions_mount["hostPath"],
+                str(host_sessions_dir().resolve()),
+            )
 
-    def test_build_run_plan_no_sessions_mount_when_disabled(self) -> None:
+    def test_build_run_spec_no_sessions_mount_when_disabled(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(share_host_sessions=False, install_pi_at_boot=False)
-            plan = build_run_plan(repo, cfg, [])
-            mounts = [
-                plan.cmd[i + 1]
-                for i, flag in enumerate(plan.cmd)
-                if flag == "--mount-hostfs"
-            ]
-            self.assertFalse(any(m.endswith(f":{GUEST_AGENT_PATH}/sessions") for m in mounts))
+            _, data = self._plan_spec(repo, cfg, [])
+            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
+            self.assertNotIn(f"{GUEST_AGENT_PATH}/sessions", guest_paths)
+
+    def test_prepare_agent_dir_sessions_is_real_dir_not_symlink(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(share_host_sessions=True, install_pi_at_boot=False)
+            staging = prepare_agent_dir(repo, cfg)
+            sessions = staging / "sessions"
+            self.assertTrue(sessions.is_dir())
+            self.assertFalse(sessions.is_symlink())
 
 
 class ProvisionStateTests(SandboxTestCase):
@@ -748,12 +774,17 @@ class CliOverrideTests(SandboxTestCase):
             args = Namespace(
                 model_endpoint="http://localhost:9000/v1",
                 allow_hosts=[],
+                providers=[],
+                network_policy=None,
                 vmm=None,
                 image=None,
-                no_warm=False,
+                rootfs_size=None,
                 ro=False,
+                guest_hidden_paths=[],
                 host_loopback=False,
                 no_host_loopback=False,
+                no_auto_approve=False,
+                mirror_host_pi=False,
             )
             cfg = _cfg_from_args(repo, args)
             self.assertTrue(cfg.host_loopback.enabled)
@@ -770,12 +801,17 @@ class CliOverrideTests(SandboxTestCase):
             args = Namespace(
                 model_endpoint=None,
                 allow_hosts=[],
+                providers=[],
+                network_policy=None,
                 vmm=None,
                 image=None,
-                no_warm=False,
+                rootfs_size=None,
                 ro=False,
+                guest_hidden_paths=[],
                 host_loopback=False,
                 no_host_loopback=True,
+                no_auto_approve=False,
+                mirror_host_pi=False,
             )
             cfg = _cfg_from_args(repo, args)
             self.assertFalse(cfg.host_loopback.enabled)
@@ -786,7 +822,9 @@ class DoctorTests(unittest.TestCase):
         results = run_doctor()
         names = {r.name for r in results}
         self.assertIn("node", names)
+        self.assertIn("npm", names)
         self.assertIn("qemu", names)
+        self.assertIn("sidecar", names)
         self.assertIn("disk", names)
 
     def test_doctor_ok_requires_core(self) -> None:
@@ -794,7 +832,7 @@ class DoctorTests(unittest.TestCase):
 
         ok = [
             CheckResult("node", True, ""),
-            CheckResult("npx", True, ""),
+            CheckResult("npm", True, ""),
             CheckResult("qemu", True, ""),
             CheckResult("virtualization", True, ""),
             CheckResult("disk", True, ""),
@@ -833,20 +871,27 @@ class NetworkPolicyTests(SandboxTestCase):
         self.assertEqual(hosts, ["api.openai.com"])
         self.assertFalse(unrestricted)
 
-    def test_build_run_plan_fails_closed_by_default(self) -> None:
+    def test_build_run_spec_fails_closed_by_default(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=False)
             plan = build_run_plan(repo, cfg, [])
-            allow = [plan.cmd[i + 1] for i, f in enumerate(plan.cmd) if f == "--allow-host"]
-            self.assertEqual(allow, [DENY_ALL_SENTINEL])
+            try:
+                data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            finally:
+                plan.spec_path.unlink(missing_ok=True)
+            self.assertEqual(data["network"]["allowedHosts"], [DENY_ALL_SENTINEL])
 
-    def test_build_run_plan_allow_all_passes_no_allow_host(self) -> None:
+    def test_build_run_spec_allow_all_policy(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(install_pi_at_boot=False, network_policy="allow-all")
             plan = build_run_plan(repo, cfg, [])
-            self.assertNotIn("--allow-host", plan.cmd)
+            try:
+                data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            finally:
+                plan.spec_path.unlink(missing_ok=True)
+            self.assertEqual(data["network"]["policy"], "allow-all")
 
 
 class ProviderPresetTests(SandboxTestCase):
@@ -864,12 +909,16 @@ class ProviderPresetTests(SandboxTestCase):
         self.assertIn("api.anthropic.com", hosts)
         self.assertIn("x.example.com", hosts)
 
-    def test_provider_domains_reach_run_plan(self) -> None:
+    def test_provider_domains_reach_run_spec(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(providers=["openai"], install_pi_at_boot=False)
             plan = build_run_plan(repo, cfg, [])
-            allow = [plan.cmd[i + 1] for i, f in enumerate(plan.cmd) if f == "--allow-host"]
+            try:
+                data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            finally:
+                plan.spec_path.unlink(missing_ok=True)
+            allow = data["network"]["allowedHosts"]
             self.assertIn("api.openai.com", allow)
             self.assertNotIn(DENY_ALL_SENTINEL, allow)
 
@@ -901,10 +950,12 @@ class SecretEnvTests(SandboxTestCase):
             os.environ["MY_PAT"] = "secret-value"
             try:
                 plan = build_run_plan(repo, cfg, [])
+                data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
             finally:
                 os.environ.pop("MY_PAT", None)
+                plan.spec_path.unlink(missing_ok=True)
             self.assertNotIn("secret-value", " ".join(plan.cmd))
-            self.assertIn("GH_TOKEN@api.github.com", plan.cmd)
+            self.assertIn("GH_TOKEN", data["network"]["secrets"])
             self.assertEqual(plan.env["GH_TOKEN"], "secret-value")
 
 

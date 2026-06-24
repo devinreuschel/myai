@@ -99,19 +99,18 @@ uv run python -m unittest discover -s tests
 
 ## Sandbox (pi in a micro-VM)
 
-Run `pi` inside a Gondolin micro-VM. The repo is mounted at its real host path by
-default, so it feels like plain `pi` but the process is hardware-isolated.
+Run `pi` inside a Gondolin micro-VM via a Node sidecar that drives the Gondolin SDK directly. The repo is mounted at its real host path by default, so it feels like plain `pi` but the process is hardware-isolated. Project `.myai/` is hidden from the guest by default.
 
 ```bash
-myai sandbox doctor          # check Node, QEMU, disk, etc.
+myai sandbox doctor          # check Node, npm, QEMU, disk, sidecar, etc.
 myai sandbox init            # write .myai/sandbox.json
-myai sandbox provision       # one-time pi install (allows npm/github)
-myai sandbox run             # interactive pi in the VM
+myai sandbox provision       # one-time pi install + sidecar npm install
+myai sandbox run             # interactive pi in the VM (cold boot each run)
 myai sandbox run -- -- -p "hello"   # pass args to pi
+myai sandbox run -- --resume <id>   # resume a pi session inside the VM
 ```
 
-Prerequisites: Node.js >= 23.6, QEMU (or krun on Apple Silicon), ~5 GiB free
-disk. First run downloads ~200MB of guest assets.
+Prerequisites: Node.js >= 23.6, npm, QEMU (or krun on Apple Silicon), ~5 GiB free disk. First run downloads ~200MB of guest assets and npm-installs the Gondolin SDK into `$MYAI_HOME/sandbox/sidecar/`.
 
 **Provisioning vs runtime:** pi and its tools (fd, ripgrep) install in a separate
 one-time provisioning VM that allows npm/github. The host caches them under
@@ -181,25 +180,16 @@ For myai-managed repos that do not target pi (see `.myai/config.json`), the sand
 
 ### Other knobs
 
-- `mirror_host_pi` / `--mirror-host-pi`: mirror host `~/.pi/agent/settings.json`
-  (packages, default provider/model/thinking level, theme) into the guest.
-  Localhost provider URLs are rewritten to the loopback host. Packages install
-  once during provisioning (git/npm/github allowed there, not at runtime).
-- `llama_server_url`: passed to the guest as `LLAMA_SERVER_URL` (localhost
-  rewritten to the loopback host) for the `pi-llama-cpp` extension.
-- `share_host_sessions` (default true): bind host `~/.pi/agent/sessions` so host
-  and guest `pi` share one pool. `pi -r` / `pi --session <id>` work in both.
-- `guest_repo_mount`: `"host_path"` (default) mounts at the real absolute path so
-  cross-resume lines up; `"workspace"` mounts at `/workspace` (no path leak). In
-  workspace mode the `--workspace--` session slot is symlinked to the repo's real
-  session dir so shared sessions still line up.
-- `auto_approve` (default true) / `--no-auto-approve`: pi auto-approves tool calls
-  inside the sandbox. Disable to require approval even when isolated.
+- `mirror_host_pi` / `--mirror-host-pi`: mirror host `~/.pi/agent/settings.json` (packages, default provider/model/thinking level, theme) into the guest. Localhost provider URLs are rewritten to the loopback host. Packages install once during provisioning (git/npm/github allowed there, not at runtime).
+- `llama_server_url`: passed to the guest as `LLAMA_SERVER_URL` (localhost rewritten to the loopback host) for the `pi-llama-cpp` extension.
+- `share_host_sessions` (default true): bind host `~/.pi/agent/sessions` at `/root/.pi/agent/sessions` in the guest. `pi --resume <id>` works on the host or via `myai sandbox run -- --resume <id>`.
+- `guest_hidden_paths` (default `["/.myai"]`) / `--hide`: workspace paths hidden and denied in the guest via Gondolin `ShadowProvider`. Host reads `.myai/sandbox.json`; the guest does not need repo-level `.myai/`.
+- `guest_repo_mount`: `"host_path"` (default) mounts at the real absolute path so cross-resume lines up; `"workspace"` mounts at `/workspace` (no path leak). In workspace mode the `--workspace--` session slot is symlinked to the repo's real session dir so shared sessions still line up.
+- `auto_approve` (default true) / `--no-auto-approve`: pi auto-approves tool calls inside the sandbox. Disable to require approval even when isolated.
 - `rootfs_size` / `--rootfs-size`: grow the guest root disk (needs `e2fsprogs`).
-- `--debug`: after the run, list executables the guest tried to run but couldn't
-  find (handy when the agent reaches for a tool not installed in the image).
+- `--debug`: after the run, list executables the guest tried to run but couldn't find (handy when the agent reaches for a tool not installed in the image).
 
-Warm reuse: `myai sandbox register <session-id>`, `myai sandbox ls`,
-`myai sandbox snapshot <id> --repo .`, `myai sandbox stop --repo .`.
+Each run cold-boots a fresh VM that exits when pi exits. Pi install and sidecar
+deps are cached on the host under `$MYAI_HOME/sandbox/`.
 
 Custom pi image: see [myai/sandbox/image/README.md](myai/sandbox/image/README.md).
