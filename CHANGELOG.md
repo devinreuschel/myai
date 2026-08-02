@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `myai teams` skeleton: SQLite board under XDG state (`teams.db`, transcripts/worktrees dirs, `daemon.lock`, role prompts); `init`, `project new|edit|list`, `epic add|list|show|approve|abandon`, `task add|edit|list|show`, `status` — view/edit/queue with no daemon
+- Project config as YAML-edited JSON (roster, pipeline, concurrency ceilings, budgets, standups, notifications, `epic_checks`); default prompts installed to `$MYAI_HOME/prompts/`
+- PyYAML dependency for teams config and task frontmatter round-trips
 - myai-managed guardrail: when enabled (default), injects instructions not to edit synced rules/skills/subagents directly; cursor/claude get an always-apply rule (nested file or managed block), pi gets `.pi/APPEND_SYSTEM.md` via `myai sync`, non-pi managed repos also get `/root/.pi/agent/APPEND_SYSTEM.md` at VM boot
 - Global user settings in `~/.myai/config.json` (alongside `~/.myai/sandbox.json`); `inject_myai_rule` lives here
 - `myai config myai-rule [on|off]` to show or set the global default for the myai-managed guardrail

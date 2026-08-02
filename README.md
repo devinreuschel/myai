@@ -97,6 +97,18 @@ uv run python -m myai --help
 uv run python -m unittest discover -s tests
 ```
 
+## Agentic teams (board)
+
+SQLite project/epic/task board under XDG state (`$MYAI_HOME` or `~/.local/share/myai`). View and edit without a daemon; execution comes later. Design: [docs/agentic-teams-design.md](docs/agentic-teams-design.md).
+
+```bash
+myai teams init --name demo
+myai teams project edit
+myai teams epic add --title "…" --goal "…"
+myai teams task add --title "…" [--epic E-1]
+myai teams status
+```
+
 ## Sandbox (pi in a micro-VM)
 
 Run `pi` inside a Gondolin micro-VM via a Node sidecar that drives the Gondolin SDK directly. The repo is mounted at its real host path by default, so it feels like plain `pi` but the process is hardware-isolated. Project `.myai/` is hidden from the guest by default.

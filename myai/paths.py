@@ -48,3 +48,23 @@ def global_sandbox_config_write_path() -> Path:
 
 def global_config_path() -> Path:
     return global_myai_dir() / "config.json"
+
+
+def teams_db_path() -> Path:
+    return state_root() / "teams.db"
+
+
+def teams_transcripts_dir() -> Path:
+    return state_root() / "transcripts"
+
+
+def teams_worktrees_dir() -> Path:
+    return state_root() / "worktrees"
+
+
+def teams_daemon_lock_path() -> Path:
+    return state_root() / "daemon.lock"
+
+
+def teams_prompts_dir() -> Path:
+    return state_root() / "prompts"

@@ -170,21 +170,36 @@ Make myai a clean backend for agentic tools and remote use.
 
 Project/epic/task board over SQLite. Design: [docs/agentic-teams-design.md](agentic-teams-design.md). No daemon yet.
 
-- [ ] XDG paths: `teams.db`, transcripts dir, worktrees parent, `daemon.lock` under state root
-- [ ] SQLite WAL + `busy_timeout`; schema + migrations for `projects`, `epics`, `tasks`, `runs`, `events`, `approvals`, `messages`
-- [ ] Unique open-approval indexes (at most one unresolved approval per task and per epic)
-- [ ] `myai teams init`: create DB and register first project
-- [ ] Project config as data: roster, pipeline stages/roles/gates, concurrency ceilings, budgets, standups, notifications, `epic_checks`
-- [ ] Default concurrency when omitted: per-stage 1, `max_total` unset, `pm: 1`
-- [ ] `teams project new|edit|list` (YAML edit → stored `config_json`)
-- [ ] Default role prompt files referenced by roster (`prompts/pm.md`, designer, developer, qa, …)
-- [ ] Epic statuses: `grooming|awaiting_approval|executing|awaiting_review|done|abandoned`
-- [ ] Task statuses: `draft|backlog|ready|running|waiting_human|blocked|done|failed`; `blocked_by`, priority, stage, role, version, loop_count
-- [ ] `teams epic list|show|approve|abandon` (E-<id>)
-- [ ] `teams task add|edit|list|show` (T-<id>); `$EDITOR` markdown/YAML round-trip bumps `version`
-- [ ] Standalone tasks (no epic) supported alongside epic-linked tasks
-- [ ] `teams status [PROJECT]`: board overview, in-flight and queued-by-stage counts
-- [ ] CLI usable with daemon down (view/edit/queue only; no execution)
+- [x] XDG paths: `teams.db`, transcripts dir, worktrees parent, `daemon.lock` under state root
+- [x] SQLite WAL + `busy_timeout`; schema + migrations for `projects`, `epics`, `tasks`, `runs`, `events`, `approvals`, `messages`
+- [x] Unique open-approval indexes (at most one unresolved approval per task and per epic)
+- [x] `myai teams init`: create DB and register first project
+- [x] Project config as data: roster, pipeline stages/roles/gates, concurrency ceilings, budgets, standups, notifications, `epic_checks`
+- [x] Default concurrency when omitted: per-stage 1, `max_total` unset, `pm: 1`
+- [x] `teams project new|edit|list` (YAML edit → stored `config_json`)
+- [x] Default role prompt files referenced by roster (`prompts/pm.md`, designer, developer, qa, …)
+- [x] Epic statuses: `grooming|awaiting_approval|executing|awaiting_review|done|abandoned`
+- [x] Task statuses: `draft|backlog|ready|running|waiting_human|blocked|done|failed`; `blocked_by`, priority, stage, role, version, loop_count
+- [x] `teams epic list|show|approve|abandon` (E-<id>)
+- [x] `teams task add|edit|list|show` (T-<id>); `$EDITOR` markdown/YAML round-trip bumps `version`
+- [x] Standalone tasks (no epic) supported alongside epic-linked tasks
+- [x] `teams status [PROJECT]`: board overview, in-flight and queued-by-stage counts
+- [x] CLI usable with daemon down (view/edit/queue only; no execution)
+
+### Phase 13b: Agentic teams — skeleton hardening
+
+Open items from the phase 13 review. Land before phase 14 builds on the schema and config.
+
+- [ ] `create_task`: reject an `epic_id` belonging to a different project
+- [ ] `UNIQUE` on `projects.name` (migration); drop the check-then-insert race in `create_project`
+- [ ] `validate_config`: pipeline `role` must exist in the roster, stage names unique, `on_fail` must name a real stage, `per_stage`/`pm`/`max_total` values must be ints
+- [ ] Set `busy_timeout` before `journal_mode = WAL` (the WAL switch takes a brief exclusive lock)
+- [ ] `approve_epic`: stop bumping `tasks.version` on draft→backlog — version drives stale detection, and a status change is not an edit
+- [ ] `bundled_prompts_dir()`: use `importlib.resources` like migrations, not `Path(__file__)`
+- [ ] Decide: roster prompt paths relative (per design §4.1) vs absolute — absolute pins `config_json` to one `MYAI_HOME`
+- [ ] Decide: nest teams state under `state_root()/teams/` (matching `sandbox/`) vs today's flat `prompts/`, `worktrees/`, `transcripts/`, `daemon.lock`
+- [ ] Decide: task edit document should honor `epic_id`/`version`/`loop_count` or stop emitting them — currently shown and silently ignored
+- [ ] Tests: capture CLI stdout; cover duplicate project names and `task add|show|list`
 
 ### Phase 14: Agentic teams — concurrent Cursor runs
 
