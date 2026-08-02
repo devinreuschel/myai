@@ -165,3 +165,117 @@ Make myai a clean backend for agentic tools and remote use.
 - [ ] Service install: generate launchd (macOS) / systemd (Linux) units to run `myai serve` in the background
 - [ ] Docs + recipes: "use myai as your OpenAI base URL" for the common agentic tools
 - [ ] Stretch: tunnel/share helper for exposing the local endpoint to another machine
+
+### Phase 13: Agentic teams — skeleton
+
+Project/epic/task board over SQLite. Design: [docs/agentic-teams-design.md](agentic-teams-design.md). No daemon yet.
+
+- [ ] XDG paths: `teams.db`, transcripts dir, worktrees parent, `daemon.lock` under state root
+- [ ] SQLite WAL + `busy_timeout`; schema + migrations for `projects`, `epics`, `tasks`, `runs`, `events`, `approvals`, `messages`
+- [ ] Unique open-approval indexes (at most one unresolved approval per task and per epic)
+- [ ] `myai teams init`: create DB and register first project
+- [ ] Project config as data: roster, pipeline stages/roles/gates, concurrency ceilings, budgets, standups, notifications, `epic_checks`
+- [ ] Default concurrency when omitted: per-stage 1, `max_total` unset, `pm: 1`
+- [ ] `teams project new|edit|list` (YAML edit → stored `config_json`)
+- [ ] Default role prompt files referenced by roster (`prompts/pm.md`, designer, developer, qa, …)
+- [ ] Epic statuses: `grooming|awaiting_approval|executing|awaiting_review|done|abandoned`
+- [ ] Task statuses: `draft|backlog|ready|running|waiting_human|blocked|done|failed`; `blocked_by`, priority, stage, role, version, loop_count
+- [ ] `teams epic list|show|approve|abandon` (E-<id>)
+- [ ] `teams task add|edit|list|show` (T-<id>); `$EDITOR` markdown/YAML round-trip bumps `version`
+- [ ] Standalone tasks (no epic) supported alongside epic-linked tasks
+- [ ] `teams status [PROJECT]`: board overview, in-flight and queued-by-stage counts
+- [ ] CLI usable with daemon down (view/edit/queue only; no execution)
+
+### Phase 14: Agentic teams — concurrent Cursor runs
+
+Daemon orchestrates parallel isolated Cursor CLI agents on a develop-only pipeline.
+
+- [ ] `teams daemon start|stop|status`: detached process; single instance via advisory `flock` on `daemon.lock`
+- [ ] Daemon epoch (uuid) in lockfile; stamped on every launched `runs` row
+- [ ] SQLite-as-IPC: CLI writes rows; daemon polls (~1–2s); no socket protocol
+- [ ] Exactly-once transitions: message/`processed_at`, approval/`applied_at`, run outcome + task transition each in one txn
+- [ ] Agents never write task state; DB lives outside agent workspaces
+- [ ] Orchestrator owns prompt composition; adapters receive fully composed prompts only
+- [ ] `AgentBackend` protocol + `RunResult` (outcome/summary/details/`needs_human`/transcript)
+- [ ] Structured agent output: fenced JSON result block + `<needs_human>` sentinel; unparseable → `error` + inbox
+- [ ] Cursor CLI adapter spike: resume flags, non-interactive/yolo flags, `--workspace` vs CWD, `--model`, multi-agent worktree conflict
+- [ ] Cursor CLI adapter: resolve `agent`/`cursor-agent`; `agent -p --output-format json`; wall-clock timeout; tee transcript
+- [ ] Spawn each run in its own process group (`setsid`); record `pid`/`pgid`/`proc_start` on `runs`
+- [ ] `daemon stop` group-kills every live run; worktrees left in place
+- [ ] Scheduler: count in-flight by stage; dispatch only real ready work; never invent tasks to fill slots
+- [ ] Honor `concurrency.per_stage` and optional `max_total` as ceilings; claim order: DB `runs`+`running` txn, then worktree, then spawn
+- [ ] Candidate order: priority desc, then older ready first; skip if open approval or over `max_runs_per_task`
+- [ ] Task-lifetime sticky branch + worktree (`teams/T-<id>` for standalone); path under `worktrees/<project>/T-<id>/`
+- [ ] Cursor always bound to task worktree, never primary `workspace_path`; require git repo for parallel agents
+- [ ] One-stage `develop` pipeline end-to-end with multiple simultaneous children without shared-tree conflicts
+- [ ] Session `resume_token` support (optimization; cold-start if unsupported)
+- [ ] `runs` / `events` recording; `teams log T-<id>` (events + transcripts)
+- [ ] Restart reconciliation: stale-epoch in-flight runs → parse transcript or mark `error`; re-queue or inbox
+- [ ] Orphan cleanup: match `(pid, proc_start)` before kill; confirm with user (`[y/N]`)
+- [ ] Sweep unmanaged worktree dirs not referenced by any live task after reconciliation
+
+### Phase 15: Agentic teams — pipeline + epic integration
+
+Full per-task stage machines, gates/inbox, and one finished local epic branch.
+
+- [ ] User-defined multi-stage pipeline as project data (bespoke stages without source changes)
+- [ ] Independent per-task FSM: siblings advance on their own clocks under shared stage ceilings
+- [ ] Gate policies: `auto`, `human` (always pause), `epic` (pause standalone only)
+- [ ] Agent-initiated `needs_human` and bound exhaustion (`max_loops`, `max_runs_per_task`) open the same inbox shape
+- [ ] Gated task enters `waiting_human` and frees its stage slot immediately
+- [ ] QA `on_fail` bounce to prior stage; `loop_count` increments; escalate at `max_loops`; reset past qa
+- [ ] Mid-flight edit detection: `runs.task_version` vs current → `stale` + inbox, no auto-transition
+- [ ] `teams inbox`: pending approvals + escalations (non-blocking; no terminal `[y/n]`)
+- [ ] `teams approve|reject` with `-m` note routed back as feedback; apply only resolved-unapplied rows
+- [ ] Epic branch cut at scope approval: `teams/E-<id>` from `base_branch`
+- [ ] Task branches `teams/E-<n>/T-<m>`; sticky across stages on one task-lifetime worktree
+- [ ] All daemon git integration in a daemon-owned epic worktree; never merge in the human's primary checkout
+- [ ] Rebase task onto epic tip before final verifying stage (qa); rebase conflict counts as QA fail bounce
+- [ ] Promote: merge task → epic (serialized, idempotent); promote conflict → bounce to develop
+- [ ] Failed/stale/error runs never promote; worktree retained for retry
+- [ ] Optional `epic_checks` command on epic branch (default: at epic completion only)
+- [ ] When all tasks `done`: park epic `awaiting_review` with finished local branch; never push or open PRs
+- [ ] `teams epic approve` marks epic `done` and prunes task branches; review notes short of accept → new tasks on same branch
+- [ ] Deliverables live in task worktree then promote with the branch; downstream stages read them as repo files
+- [ ] Worktree remove on task `done`/abandon; task branches persist until epic merge/prune policy
+
+### Phase 16: Agentic teams — PM layer
+
+Human talks to the PM; agents execute. Grooming, chat, plan revisions, standups.
+
+- [ ] Daemon poll: unprocessed `messages` → PM; resolved approvals → apply transitions; then dispatch; then standups
+- [ ] Stateless PM: every invocation cold from project config, board, events, open approvals, message thread
+- [ ] Dedicated `concurrency.pm` budget so PM work does not starve task workers (default 1)
+- [ ] Read-only PM asks may use primary `workspace_path`; mutating PM paths take a worktree
+- [ ] `teams ask`: one-shot read-only → `from_pm` reply; no task mutation
+- [ ] `teams tell`: new goal → epic grooming; correction → gated `plan_revision` (v1: explicit flags/phrasing)
+- [ ] `teams chat [PROJECT]`: interactive PM session; approve drafted revisions/scope inline
+- [ ] Epic intake: create epic in `grooming`; dedicated `groom_prompt` planning persona
+- [ ] Conversational groom loop: epic-threaded `messages`, live `draft` tasks, human `$EDITOR` mid-groom
+- [ ] PM may explore repo between turns ("look into that and get back"); transcript + findings resume across sittings
+- [ ] Question batches as `approvals` kind `question`; answers via inbox or chat
+- [ ] Finalize via PM judgment or human "go with what you have" (state remaining assumptions)
+- [ ] `epic_approval`: refined goal, task list + deps, assumptions; approve → drafts → backlog/ready, cut epic branch
+- [ ] Reject scope → back to grooming with note
+- [ ] Ungated in-epic grooming after approval (split/add/reorder/edit); goal/scope changes need fresh `epic_approval`
+- [ ] Plan revision: structured task-patch in `payload_json` + free-form summary; daemon applies patch only after human approve
+- [ ] Rejection of plan/stage gates routes feedback to PM as re-plan trigger
+- [ ] PM-composed epic handoff summary (PR-description-ready) at `awaiting_review`
+- [ ] Rolling grooming-notes summary on epic to bound prompt context (drop old turns)
+- [ ] `teams standup [--now | --schedule]`: PM digest of events since last standup
+- [ ] Standup delivery v1: terminal nudge on next CLI use + digest file
+- [ ] Notification adapter interface (inbox + standups) so later channels plug in without scheduler changes
+
+### Phase 17: Agentic teams — polish & second backend
+
+- [ ] Claude Code CLI adapter (`claude -p`, stream-json, `--resume`) behind the same contract
+- [ ] Local llamacpp agent harness milestone (tool-calling loop) — stub/contract only until ready
+- [ ] Webhook notification adapter
+- [ ] Matrix notification adapter
+- [ ] TUI exploration (Textual) over the same DB
+- [ ] Export/import groundwork for external task systems (Jira, etc.)
+- [ ] Optional `claimed_at` lease to avoid re-running interrupted PM/backend work after crash
+- [ ] Auto-detect free-form tell as goal vs correction (today: explicit flags)
+- [ ] Detect PM tasks outside approved epic goal (today: epic branch review is the backstop)
+- [ ] Launchd / systemd user unit for `teams daemon`
+- [ ] Model routing semantics per role via roster `model_hint` (cheap QA vs strong design)
