@@ -12,9 +12,10 @@ that actually need one. Work is organized around **epics**: the human describes 
 the PM ("add a 2D grid and graphics to the game"), the PM reads the repo and grooms the
 goal into a task breakdown — asking the human clarifying questions about design forks and
 unknowns — and once the human approves the scope, the agents execute the whole task set in
-the background. The finished epic comes back as **one reviewable pull request**. The human
-interacts primarily through the PM agent — describing goals, answering questions,
-approving scope, reviewing the final PR — while a persistent **daemon owns orchestration** (scheduling, gates,
+the background. The finished epic comes back as **one complete local feature branch** —
+ready for the human to review, run, and push/PR themselves. The human interacts primarily
+through the PM agent — describing goals, answering questions, approving scope, reviewing
+the finished branch — while a persistent **daemon owns orchestration** (scheduling, gates,
 state) and **spawns Cursor CLI agents** (`agent` / `cursor-agent`) headlessly inside each
 project's repository to do the actual work. Other backends (Claude Code CLI, a local
 llamacpp harness) plug in later behind the same adapter contract; Cursor CLI is the v1
@@ -24,9 +25,10 @@ path and the reference implementation.
 
 - Project/epic/task management with a role-based agent team per project, fully configurable as data.
 - **Human effort scales with goals, not tasks.** Scope approval once per epic, review once
-  per epic (a single PR); everything between — grooming, design → develop → QA loops with
-  bounded retries, task-level integration — is automated, escalating only on genuine
-  unknowns. An epic groomed into 100 tasks still costs the human one approval and one PR.
+  per epic (a single finished branch); everything between — grooming, design → develop → QA
+  loops with bounded retries, task-level integration — is automated, escalating only on
+  genuine unknowns. An epic groomed into 100 tasks still costs the human one approval and
+  one review.
 - User-defined pipelines: the stage list, roles, prompts, and gates are project data, so a
   team can encode bespoke workflows (multiple design passes, a security stage) without
   source changes.
@@ -40,7 +42,8 @@ path and the reference implementation.
 - **Worktree isolation for concurrent Cursor runs:** multiple `agent -p` processes must not
   share one working tree (they will overwrite each other's edits). Each task gets its own
   git worktree for its lifetime; Cursor is bound to that path, not the project's primary
-  checkout. Task branches merge into an epic branch, which becomes the single PR (§7.3).
+  checkout. Task branches merge into an epic branch, handed over as one finished local
+  branch (§7.3).
 - Async human-in-the-loop: approvals and escalations queue in an inbox rather than blocking a terminal.
 - A PM agent as the single conversational interface: status queries, directives, scheduled standups.
 - Human-editable tasks via `$EDITOR` round-tripping (TUI later), with mid-flight-edit detection.
@@ -180,8 +183,7 @@ CREATE TABLE epics (
   goal          TEXT NOT NULL,           -- markdown; the human's ask + PM's refined goal statement
   status        TEXT NOT NULL,           -- grooming|awaiting_approval|executing|awaiting_review|done|abandoned
   branch        TEXT,                    -- epic integration branch (teams/E-<id>); cut at scope approval
-  base_branch   TEXT NOT NULL,           -- PR target; project default branch unless overridden
-  pr_ref        TEXT,                    -- PR URL/number once opened
+  base_branch   TEXT NOT NULL,           -- eventual merge target; project default branch unless overridden
   version       INTEGER NOT NULL DEFAULT 1, -- bumped on scope edits
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
@@ -193,7 +195,8 @@ CREATE TABLE tasks (
   epic_id       INTEGER REFERENCES epics(id), -- NULL = standalone task (per-task gates apply)
   title         TEXT NOT NULL,
   body          TEXT NOT NULL,           -- markdown; the agent-facing spec
-  status        TEXT NOT NULL,           -- backlog|ready|running|waiting_human|blocked|done|failed
+  status        TEXT NOT NULL,           -- draft|backlog|ready|running|waiting_human|blocked|done|failed
+                                         -- draft = groomed but epic not yet approved; never dispatched
   stage         TEXT,                    -- current pipeline stage name
   role          TEXT,                    -- role assigned for the current stage
   priority      INTEGER NOT NULL DEFAULT 0, -- higher dispatches first; ties broken by age
@@ -260,6 +263,7 @@ CREATE UNIQUE INDEX approvals_open_epic ON approvals(epic_id)
 CREATE TABLE messages (
   id            INTEGER PRIMARY KEY,     -- human <-> PM channel
   project_id    INTEGER NOT NULL,
+  epic_id       INTEGER REFERENCES epics(id), -- set = part of that epic's grooming/review thread
   direction     TEXT NOT NULL,           -- to_pm|from_pm
   body          TEXT NOT NULL,
   created_at    TEXT NOT NULL,
@@ -291,7 +295,8 @@ A team is data, not code. Everything lives in `projects.config_json` (authored a
 
 ```yaml
 roster:
-  pm:        { backend: cursor, model_hint: null, prompt: prompts/pm.md }
+  pm:        { backend: cursor, model_hint: null, prompt: prompts/pm.md,
+               groom_prompt: prompts/pm-groom.md }   # planning-mode persona (§4.2 step 1)
   designer:  { backend: cursor, prompt: prompts/designer.md }
   developer: { backend: cursor, prompt: prompts/developer.md }
   qa:        { backend: cursor, prompt: prompts/qa.md }
@@ -308,11 +313,11 @@ pipeline:
     on_fail: develop       # bounce back with feedback
     max_loops: 3           # then escalate to human
   - stage: review
-    gate: epic             # epic tasks: covered by the epic PR; standalone tasks gate here
+    gate: epic             # epic tasks: covered by the epic review; standalone tasks gate here
 
 # Gate values — auto: never pause. human: always pause per task, even inside an epic
 # (for pipelines that want it). epic: pause only for standalone tasks; epic tasks are
-# covered by scope approval up front and the epic PR at the end. The pipeline is data:
+# covered by scope approval up front and the epic branch review at the end. The pipeline is data:
 # bespoke stages (multiple design passes, a security pass) are just more entries.
 
 # Upper bounds on simultaneous Cursor CLI agents for this project — not fill targets.
@@ -348,24 +353,43 @@ Adding a role (say, a security reviewer) means adding a roster entry and a pipel
 no source changes. Tuning parallelism is the same kind of edit: bump `concurrency.per_stage`
 and the scheduler honors the new ceiling on the next poll (still only when work exists).
 
-### 4.2 Epics: goal → groomed plan → one PR
+### 4.2 Epics: goal → groomed plan → one finished branch
 
 The **epic is the unit of human interaction; the task is the unit of execution.** Humans
 deal in goals; agents deal in the 100 tasks a goal grooms into.
 
 1. **Intake.** The human describes a goal to the PM (`teams tell "add a 2D grid and
-   graphics to the game"`, or via `chat`). The PM creates an epic in `grooming`, explores
-   the repo (read-only run against `workspace_path`), and drafts a refined goal statement
-   plus a story breakdown that gets from current repo state to the goal.
-2. **Clarify.** Unknowns and design forks become `question` items — batched into one inbox
-   entry, or asked live in `chat`. Answers feed back into grooming; the PM keeps splitting
-   stories until it judges them fine-grained enough to implement. This loop is where the
-   human spends their ideation and design-alignment time, and it's the intended place for
-   back-and-forth — cheap now, expensive after 100 tasks execute against a misunderstanding.
-3. **Scope approval.** The PM posts an `epic_approval`: refined goal + full task list with
-   dependencies. This is the "did the PM understand me" checkpoint. Approve → tasks are
-   created, the epic branch is cut from `base_branch`, execution starts. Reject with a
-   note → back to grooming.
+   graphics to the game"`, or via `chat`). The PM creates an epic in `grooming` and starts
+   from a dedicated grooming prompt: *you are planning with a human right now — explore
+   the repo, think about implementation approaches and their implications for this
+   project, hunt edge cases, surface design forks, ask rather than assume.*
+2. **Groom (conversational loop).** Grooming is a conversation, not a form. Each turn: the
+   PM digests the human's latest input, explores the repo as needed (read-only runs under
+   the `pm` ceiling — "let me look into that and get back to you" is a legal move), and
+   comes back with thoughts, implications, and questions; the human answers, redirects, or
+   pushes back; repeat. Expect a real working session (30–60 minutes for a meaty epic).
+   Mechanics that make it work:
+   - **Transcript in the DB.** Grooming messages are threaded to the epic
+     (`messages.epic_id`); every PM turn is a cold invocation that receives the running
+     transcript plus its accumulated repo findings, so the PM stays stateless (§4.4) and
+     the session is resumable — walk away mid-grooming and pick it up tomorrow, or answer
+     queued questions from the inbox instead of live chat.
+   - **Draft tasks materialize live.** As understanding firms up, the PM writes tasks with
+     status `draft` under the epic. The human watches the board take shape during the
+     conversation and can `$EDITOR`-edit or delete drafts mid-conversation; edits are just
+     more grooming input.
+   The loop ends one of two ways: **(a)** the PM judges marginal questions no longer worth
+   the human's time and proposes finalization, or **(b)** the human says "you have enough
+   — go with what you have," and the PM finalizes immediately, stating its remaining
+   assumptions explicitly. This conversation is where the human spends their ideation and
+   design-alignment budget — cheap now, expensive after 100 tasks execute against a
+   misunderstanding.
+3. **Scope approval.** The PM posts an `epic_approval`: refined goal, full task list with
+   dependencies, and any assumptions it's proceeding on. This is the "did the PM
+   understand me" checkpoint — usually a formality by now, approved inline in chat with a
+   keystroke. Approve → `draft` tasks flip to `backlog`/`ready`, the epic branch is cut
+   from `base_branch`, execution starts, and the human walks away. Reject with a note →
+   back to grooming.
 4. **Execute.** Tasks flow the pipeline concurrently under the normal ceilings. Inside an
    approved epic the PM grooms **without gates**: it may split, add, reorder, edit, and
    re-prioritize its epic's tasks as execution teaches it things. Still gated: changes to
@@ -373,11 +397,14 @@ deal in goals; agents deal in the 100 tasks a goal grooms into.
    (`plan_revision`, §5.3 — confirms understanding), and per-task escalations
    (`needs_human`, loop/budget exhaustion, stale results). Human effort scales with goals
    plus genuine unknowns — not with task count.
-5. **Review.** When every task is `done`, the daemon opens one PR from the epic branch to
-   `base_branch` (§7.3) and parks the epic in `awaiting_review`. The human reviews a
-   single complete, in-theory-tested body of work — read it, run the tests, boot the app —
-   and merges. Review notes short of approval become new tasks on the same epic branch;
-   the PR updates in place.
+5. **Review.** When every task is `done`, the daemon parks the epic in `awaiting_review`
+   with a PM-composed handoff summary (§7.3). What the agents deliver is a **local epic
+   branch that is "complete" by their standards** — every task groomed, built, QA'd, and
+   integrated. The human reviews it on their own terms: read the diff, run the tests, boot
+   the app, then push and open the PR themselves (`gh` or otherwise) or merge locally.
+   Review notes short of acceptance go back to the PM and become new tasks on the same
+   branch. `teams epic approve` marks the epic `done` and prunes its task branches — the
+   daemon never pushes.
 
 Standalone tasks (no epic) remain supported with per-task gates — for one-off chores that
 don't warrant grooming.
@@ -416,7 +443,11 @@ three times, then escalate."
 
 The PM never answers from its own memory. Every PM invocation is cold and receives: the
 project config, epic summaries, a task-board summary, recent `events` rows, relevant open
-approvals, and the human's message. Status answers, standup digests, and plan revisions are all derived
+approvals, and the human's message. During grooming it additionally receives the epic's
+message thread and draft tasks — a long grooming *conversation* is many cold *invocations*
+over an ever-growing DB-resident transcript, which is what makes grooming resumable across
+sittings and crashes. (Backend session resume can make consecutive turns cheaper, as an
+optimization — never a correctness dependency.) Status answers, standup digests, and plan revisions are all derived
 from the DB at invocation time. This keeps updates truthful across crashes and human
 edits, and sidesteps context-window management entirely.
 
@@ -648,12 +679,12 @@ Requirement on `workspace_path`: it must be a git repo (or the project opts into
 non-git isolation mode — not v1). Non-git projects cannot use parallel Cursor agents until
 that exists.
 
-### 7.3 Integration, conflicts, and the epic PR
+### 7.3 Integration, conflicts, and the epic handoff
 
-Git topology: `base_branch` ◀— PR — epic branch `teams/E-<n>` ◀— promote — task branches
-`teams/E-<n>/T-<m>` ◀— agent worktrees. The human reviews once, at the PR. Standalone
-tasks skip the middle layer: their branch rebases against and promotes directly to the
-project integration branch, gated per-task by the pipeline.
+Git topology: `base_branch` ◀— human push/PR/merge — epic branch `teams/E-<n>` ◀— promote —
+task branches `teams/E-<n>/T-<m>` ◀— agent worktrees. The human reviews once, at the
+finished epic branch. Standalone tasks skip the middle layer: their branch rebases against
+and promotes directly to the project integration branch, gated per-task by the pipeline.
 
 **Never merge in the primary checkout.** The human may have `workspace_path` dirty at any
 moment. All daemon-side git integration happens in a dedicated daemon-owned worktree of
@@ -681,12 +712,15 @@ what lets the `runs.outcome` transaction safely follow the git side effect (§2.
 on the epic branch after each promote (or only at epic completion, configurable); a
 failure opens an inbox item rather than letting integration drift accumulate silently.
 
-**The epic PR.** When the last task is `done`, the daemon pushes the epic branch and opens
-one PR against `base_branch` — via `gh` where configured, otherwise it surfaces the branch
-as ready along with a PM-composed summary. The PM writes the PR description from the
-epic's events and task summaries. The epic parks in `awaiting_review`; the human reads,
-runs, and merges one complete unit of work. Review feedback short of a merge becomes new
-tasks on the same epic branch, and the PR updates in place.
+**Handoff, not PR.** The daemon's git responsibility ends at the epic branch. When the
+last task is `done`, it composes a handoff summary via the PM (what was built, task list,
+notable decisions, how to verify — PR-description-ready) and parks the epic in
+`awaiting_review`. It never pushes and never opens PRs: no remote credentials, no forge
+coupling, nothing leaves the machine. The human reviews the local branch — diff it, run
+the tests, boot the app — then pushes and PRs with their own tooling (`gh` on their
+machine, or a plain `git push` + web UI), or merges locally. Feedback short of acceptance
+routes to the PM as new tasks on the same branch; `teams epic approve` marks the epic
+`done` and prunes task branches.
 
 ### 7.4 Recovery
 
@@ -729,25 +763,28 @@ tasks on the same epic branch, and the PR updates in place.
    epic branch topology (`base ← epic ← task`), rebase-before-QA + promote with
    conflict-as-QA-failure bouncing (§7.3), declared/`epic` gates, inbox, approve/reject with
    feedback routing, qa `on_fail`/`max_loops` + `budgets.max_runs_per_task`, stale-version
-   handling, epic PR creation at completion. Independent task FSMs under the same
-   concurrency ceilings.
-4. **M4 — PM layer:** stateless PM invocations, epic intake + grooming loop (clarifying
-   `question` batches, `epic_approval`, ungated in-epic grooming), `teams chat`/`tell`,
-   plan revisions as gated artifacts, PM-composed PR descriptions, standup generation +
+   handling, epic handoff (`awaiting_review` + finished branch) at completion. Independent
+   task FSMs under the same concurrency ceilings.
+4. **M4 — PM layer:** stateless PM invocations, epic intake + conversational grooming loop
+   (epic-threaded transcript, draft tasks, `question` batches, `epic_approval`,
+   "go with what you have" finalization, ungated in-epic grooming), `teams chat`/`tell`,
+   plan revisions as gated artifacts, PM-composed handoff summaries, standup generation +
    scheduling (PM concurrency budget).
 5. **M5 — Polish & second backend:** Claude Code adapter, notification adapters
    (webhook/Matrix), TUI exploration, export/import groundwork.
 
 ## 9. Open questions
 
-- PR mechanics: hard-depend on `gh`, add forge adapters (GitLab, Gitea), or is the v1
-  fallback ("epic branch is ready, here's the summary") acceptable when `gh` is absent?
+- Grooming transcript growth: a long conversation eventually outgrows a single PM
+  invocation's context. Proposed: PM maintains a rolling "grooming notes" summary on the
+  epic (updated each turn, stored in DB) and old transcript turns drop out of the prompt;
+  confirm shape in M4.
 - `epic_checks` default cadence — after every promote (catches drift early, costs runtime
   per promote) vs. only at epic completion. Proposed default: at completion only.
 - Grooming-vs-scope boundary precision: task-patches within an epic are ungated, epic
   `goal` edits are gated. Should the daemon try to detect "PM added a task clearly outside
-  the approved goal" in v1, or is the epic PR review the backstop? Proposed: PR is the
-  backstop; detection is a later layer.
+  the approved goal" in v1, or is the epic branch review the backstop? Proposed: review is
+  the backstop; detection is a later layer.
 - Git integration depth beyond promote: should the orchestrator always create the stage
   commit, or may the agent commit and the orchestrator only merge?
 - Model routing per role (cheap model for QA triage, strong model for design) — supported
@@ -766,8 +803,9 @@ tasks on the same epic branch, and the PR updates in place.
   is never written by the daemon.
 - ~~Merge / promote policy + conflict handling.~~ **Resolved (§7.3):** rebase task branch
   onto epic tip before final QA; promote merges into the epic branch, serialized; rebase or
-  merge conflicts bounce to `develop` like a QA failure, bounded by `max_loops`; one PR per
-  epic at completion.
+  merge conflicts bounce to `develop` like a QA failure, bounded by `max_loops`; handoff is
+  one finished local branch per epic — the daemon never pushes or opens PRs; the human PRs
+  with their own tooling.
 - ~~Worktree parent directory location.~~ **Resolved:** XDG data dir
   (`~/.local/share/<cli>/worktrees/<project>/T-<id>/`) — outside the repo so it can never
   be committed, and per-task now that worktrees are task-lifetime.
