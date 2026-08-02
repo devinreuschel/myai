@@ -60,6 +60,12 @@ llama.cpp/
 *.gguf
 *.bin
 
+# AI configs
+.cursor/
+.claude/
+.pi/
+AGENTS.md
+
 # Logs
 *.log
 logs/
