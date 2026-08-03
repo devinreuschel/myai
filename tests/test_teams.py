@@ -1,8 +1,10 @@
 import argparse
+import io
 import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +17,7 @@ from myai.paths import (
     teams_daemon_lock_path,
     teams_db_path,
     teams_prompts_dir,
+    teams_root,
     teams_transcripts_dir,
     teams_worktrees_dir,
 )
@@ -24,11 +27,14 @@ from myai.teams.config import (
     apply_concurrency_defaults,
     default_config,
     install_default_prompts,
+    resolve_prompt_path,
+    validate_config,
 )
 from myai.teams.db import connect, ensure_state_dirs, migrate, open_db
 from myai.teams.editor import EditorError, EditRejected, edit_text
 from myai.teams.ids import IdError, format_epic_id, parse_epic_id, parse_task_id
 from myai.teams.store import (
+    StoreError,
     abandon_epic,
     approve_epic,
     create_epic,
@@ -61,11 +67,14 @@ class TestPathsAndMigrate(TeamsTestCase):
     def test_open_db_creates_layout_and_schema(self) -> None:
         conn = open_db()
         try:
+            self.assertEqual(teams_db_path(), teams_root() / "teams.db")
             self.assertTrue(teams_db_path().is_file())
+            self.assertTrue(str(teams_db_path()).startswith(str(teams_root())))
             self.assertTrue(teams_transcripts_dir().is_dir())
             self.assertTrue(teams_worktrees_dir().is_dir())
             self.assertTrue(teams_daemon_lock_path().is_file())
             self.assertTrue(teams_prompts_dir().is_dir())
+            self.assertEqual(teams_prompts_dir(), teams_root() / "prompts")
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -83,10 +92,20 @@ class TestPathsAndMigrate(TeamsTestCase):
                 "schema_migrations",
             ):
                 self.assertIn(name, tables)
-            version = conn.execute(
-                "SELECT version FROM schema_migrations"
-            ).fetchone()[0]
-            self.assertEqual(version, 1)
+            versions = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            ]
+            self.assertEqual(versions, [1, 2])
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            self.assertIn("projects_name", indexes)
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
             self.assertEqual(mode.lower(), "wal")
         finally:
@@ -171,25 +190,103 @@ class TestConfig(TeamsTestCase):
         self.assertEqual(out["concurrency"]["pm"], 1)
         self.assertNotIn("max_total", out["concurrency"])
 
-    def test_default_config_roster_points_at_xdg_prompts(self) -> None:
+    def test_default_config_roster_uses_relative_prompts(self) -> None:
         install_default_prompts()
         cfg = default_config()
-        for role in ("pm", "designer", "developer", "qa"):
-            prompt = Path(cfg["roster"][role]["prompt"])
-            self.assertTrue(str(prompt).startswith(str(teams_prompts_dir())))
-            self.assertTrue(prompt.is_file())
-        self.assertTrue(Path(cfg["roster"]["pm"]["groom_prompt"]).is_file())
+        for role, filename in (
+            ("pm", "pm.md"),
+            ("designer", "designer.md"),
+            ("developer", "developer.md"),
+            ("qa", "qa.md"),
+        ):
+            rel = cfg["roster"][role]["prompt"]
+            self.assertEqual(rel, f"prompts/{filename}")
+            resolved = resolve_prompt_path(rel)
+            self.assertEqual(resolved, teams_prompts_dir() / filename)
+            self.assertTrue(resolved.is_file())
+        groom = resolve_prompt_path(cfg["roster"]["pm"]["groom_prompt"])
+        self.assertTrue(groom.is_file())
+
+    def test_resolve_prompt_path_project_local(self) -> None:
+        ws = self.home / "ws"
+        dest = ws / ".myai" / "teams" / "prompts"
+        dest.mkdir(parents=True)
+        custom = dest / "developer.md"
+        custom.write_text("custom", encoding="utf-8")
+        resolved = resolve_prompt_path(
+            ".myai/teams/prompts/developer.md", workspace_path=ws
+        )
+        self.assertEqual(resolved, custom.resolve())
+
+    def test_validate_config_pipeline_rules(self) -> None:
+        base = {
+            "roster": {
+                "developer": {"backend": "cursor", "prompt": "prompts/dev.md"},
+            },
+            "pipeline": [
+                {"stage": "develop", "role": "developer", "gate": "auto"},
+            ],
+        }
+        validate_config(base)
+
+        bad_role = {
+            **base,
+            "pipeline": [{"stage": "develop", "role": "nope", "gate": "auto"}],
+        }
+        with self.assertRaises(ConfigError):
+            validate_config(bad_role)
+
+        dup = {
+            **base,
+            "pipeline": [
+                {"stage": "develop", "role": "developer"},
+                {"stage": "develop", "role": "developer"},
+            ],
+        }
+        with self.assertRaises(ConfigError):
+            validate_config(dup)
+
+        bad_fail = {
+            **base,
+            "pipeline": [
+                {
+                    "stage": "qa",
+                    "role": "developer",
+                    "on_fail": "missing",
+                }
+            ],
+        }
+        with self.assertRaises(ConfigError):
+            validate_config(bad_fail)
+
+        bad_per = {
+            **base,
+            "concurrency": {"per_stage": {"develop": "2"}},
+        }
+        with self.assertRaises(ConfigError):
+            validate_config(bad_per)
 
 
 class TestStoreAndCli(TeamsTestCase):
+    def _capture(self, fn, *args, **kwargs) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = fn(*args, **kwargs)
+        return code, buf.getvalue()
+
     def test_init_and_project_list(self) -> None:
         ws = self.home / "repo"
         ws.mkdir()
         ns = argparse.Namespace(name="demo", path=str(ws))
-        self.assertEqual(teams_cmd.run_init(ns), 0)
-        self.assertEqual(
-            teams_cmd.run_project_list(argparse.Namespace()), 0
+        code, out = self._capture(teams_cmd.run_init, ns)
+        self.assertEqual(code, 0)
+        self.assertIn("demo", out)
+        code, out = self._capture(
+            teams_cmd.run_project_list, argparse.Namespace()
         )
+        self.assertEqual(code, 0)
+        self.assertIn("demo", out)
+        self.assertIn(str(ws.resolve()), out)
         conn = open_db()
         try:
             rows = list_projects(conn)
@@ -198,6 +295,19 @@ class TestStoreAndCli(TeamsTestCase):
         finally:
             conn.close()
         self.assertEqual(teams_cmd.run_init(ns), 1)
+
+    def test_duplicate_project_name(self) -> None:
+        conn = open_db()
+        try:
+            install_default_prompts()
+            create_project(conn, name="demo", workspace_path=str(self.home))
+            with self.assertRaises(StoreError) as ctx:
+                create_project(
+                    conn, name="demo", workspace_path=str(self.home / "other")
+                )
+            self.assertIn("already exists", str(ctx.exception))
+        finally:
+            conn.close()
 
     def test_project_edit_round_trip(self) -> None:
         conn = open_db()
@@ -256,9 +366,11 @@ class TestStoreAndCli(TeamsTestCase):
             )
             self.assertEqual(draft["status"], "draft")
 
+            self.assertEqual(draft["version"], 1)
             approve_epic(conn, epic["id"])
             draft2 = get_task(conn, draft["id"])
             self.assertEqual(draft2["status"], "backlog")
+            self.assertEqual(draft2["version"], 1)
             epic2 = conn.execute(
                 "SELECT * FROM epics WHERE id = ?", (epic["id"],)
             ).fetchone()
@@ -277,6 +389,74 @@ class TestStoreAndCli(TeamsTestCase):
             self.assertEqual(epic3["status"], "done")
         finally:
             conn.close()
+
+    def test_create_task_rejects_cross_project_epic(self) -> None:
+        conn = open_db()
+        try:
+            install_default_prompts()
+            a = create_project(
+                conn, name="a", workspace_path=str(self.home / "a")
+            )
+            b = create_project(
+                conn, name="b", workspace_path=str(self.home / "b")
+            )
+            epic = create_epic(
+                conn, project_id=a["id"], title="e", goal="g"
+            )
+            with self.assertRaises(StoreError) as ctx:
+                create_task(
+                    conn,
+                    project_id=b["id"],
+                    title="t",
+                    epic_id=epic["id"],
+                )
+            self.assertIn("different project", str(ctx.exception))
+        finally:
+            conn.close()
+
+    def test_cli_task_add_show_list(self) -> None:
+        ws = self.home / "repo"
+        ws.mkdir()
+        self.assertEqual(
+            teams_cmd.run_init(
+                argparse.Namespace(name="demo", path=str(ws))
+            ),
+            0,
+        )
+        code, out = self._capture(
+            teams_cmd.run_task_add,
+            argparse.Namespace(
+                title="chore",
+                body="do it",
+                epic=None,
+                status=None,
+                priority=0,
+                stage=None,
+                role=None,
+                project="demo",
+            ),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("T-1", out)
+        self.assertIn("chore", out)
+        self.assertIn("standalone", out)
+
+        code, out = self._capture(
+            teams_cmd.run_task_list,
+            argparse.Namespace(project="demo", epic=None),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("T-1", out)
+        self.assertIn("chore", out)
+
+        code, out = self._capture(
+            teams_cmd.run_task_show,
+            argparse.Namespace(task_id="T-1"),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("id:         T-1", out)
+        self.assertIn("title:      chore", out)
+        self.assertIn("do it", out)
 
     def test_epic_abandon(self) -> None:
         conn = open_db()
@@ -319,6 +499,13 @@ class TestStoreAndCli(TeamsTestCase):
             self.assertEqual(updated["title"], "t2")
             self.assertEqual(updated["body"], "new")
             self.assertEqual(updated["priority"], 5)
+
+            # Stub fields are read-only
+            fields2 = parse_task_edit_document(task_edit_document(updated))
+            fields2["version"] = 99
+            with self.assertRaises(StoreError) as ctx:
+                update_task_from_edit(conn, task["id"], **fields2)
+            self.assertIn("read-only", str(ctx.exception))
         finally:
             conn.close()
 
@@ -410,9 +597,11 @@ class TestMigrationAtomicity(TeamsTestCase):
             self.assertIn("projects", tables)
             versions = [
                 row[0]
-                for row in conn.execute("SELECT version FROM schema_migrations")
+                for row in conn.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
             ]
-            self.assertEqual(versions, [1])
+            self.assertEqual(versions, [1, 2])
         finally:
             conn.close()
 

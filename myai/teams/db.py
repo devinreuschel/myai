@@ -17,6 +17,7 @@ BUSY_TIMEOUT_MS = 5000
 # (version, resource filename under myai.teams.migrations)
 _MIGRATIONS: list[tuple[int, str]] = [
     (1, "001_initial.sql"),
+    (2, "002_projects_name_unique.sql"),
 ]
 
 
@@ -44,8 +45,9 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    # busy_timeout before WAL — the journal_mode switch takes a brief exclusive lock
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 

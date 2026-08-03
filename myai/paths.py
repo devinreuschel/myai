@@ -50,21 +50,25 @@ def global_config_path() -> Path:
     return global_myai_dir() / "config.json"
 
 
+def teams_root() -> Path:
+    return state_root() / "teams"
+
+
 def teams_db_path() -> Path:
-    return state_root() / "teams.db"
+    return teams_root() / "teams.db"
 
 
 def teams_transcripts_dir() -> Path:
-    return state_root() / "transcripts"
+    return teams_root() / "transcripts"
 
 
 def teams_worktrees_dir() -> Path:
-    return state_root() / "worktrees"
+    return teams_root() / "worktrees"
 
 
 def teams_daemon_lock_path() -> Path:
-    return state_root() / "daemon.lock"
+    return teams_root() / "daemon.lock"
 
 
 def teams_prompts_dir() -> Path:
-    return state_root() / "prompts"
+    return teams_root() / "prompts"

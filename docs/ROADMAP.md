@@ -190,16 +190,16 @@ Project/epic/task board over SQLite. Design: [docs/agentic-teams-design.md](agen
 
 Open items from the phase 13 review. Land before phase 14 builds on the schema and config.
 
-- [ ] `create_task`: reject an `epic_id` belonging to a different project
-- [ ] `UNIQUE` on `projects.name` (migration); drop the check-then-insert race in `create_project`
-- [ ] `validate_config`: pipeline `role` must exist in the roster, stage names unique, `on_fail` must name a real stage, `per_stage`/`pm`/`max_total` values must be ints
-- [ ] Set `busy_timeout` before `journal_mode = WAL` (the WAL switch takes a brief exclusive lock)
-- [ ] `approve_epic`: stop bumping `tasks.version` on draft→backlog — version drives stale detection, and a status change is not an edit
-- [ ] `bundled_prompts_dir()`: use `importlib.resources` like migrations, not `Path(__file__)`
-- [ ] Decide: roster prompt paths relative (per design §4.1) vs absolute — absolute pins `config_json` to one `MYAI_HOME`
-- [ ] Decide: nest teams state under `state_root()/teams/` (matching `sandbox/`) vs today's flat `prompts/`, `worktrees/`, `transcripts/`, `daemon.lock`
-- [ ] Decide: task edit document should honor `epic_id`/`version`/`loop_count` or stop emitting them — currently shown and silently ignored
-- [ ] Tests: capture CLI stdout; cover duplicate project names and `task add|show|list`
+- [x] `create_task`: reject an `epic_id` belonging to a different project
+- [x] `UNIQUE` on `projects.name` (migration); drop the check-then-insert race in `create_project`
+- [x] `validate_config`: pipeline `role` must exist in the roster, stage names unique, `on_fail` must name a real stage, `per_stage`/`pm`/`max_total` values must be ints
+- [x] Set `busy_timeout` before `journal_mode = WAL` (the WAL switch takes a brief exclusive lock)
+- [x] `approve_epic`: stop bumping `tasks.version` on draft→backlog — version drives stale detection, and a status change is not an edit
+- [x] `bundled_prompts_dir()`: use `importlib.resources` like migrations, not `Path(__file__)`
+- [x] Roster prompt paths relative (`prompts/…` under `teams_root()`; `.myai/…` under workspace); absolute still accepted
+- [x] Nest teams state under `state_root()/teams/` (matching `sandbox/`)
+- [x] Task edit doc keeps emitting `epic_id`/`version`/`loop_count` as read-only stubs; reject if mutated
+- [x] Tests: capture CLI stdout; cover duplicate project names and `task add|show|list`
 
 ### Phase 14: Agentic teams — concurrent Cursor runs
 

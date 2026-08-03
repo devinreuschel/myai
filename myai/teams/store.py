@@ -19,6 +19,9 @@ from myai.teams.config import (
 from myai.teams.db import TeamsDBError
 from myai.teams.ids import format_epic_id, format_task_id
 
+# Stub fields in the task edit doc — shown for context / future use; not applied.
+_EDIT_STUB_FIELDS = ("epic_id", "version", "loop_count")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -77,17 +80,16 @@ def create_project(
     workspace_path: str,
     config: dict[str, Any] | None = None,
 ) -> sqlite3.Row:
-    existing = conn.execute(
-        "SELECT id FROM projects WHERE name = ?", (name,)
-    ).fetchone()
-    if existing:
-        raise StoreError(f"project {name!r} already exists")
     cfg = validate_config(config if config is not None else default_config())
-    cur = conn.execute(
-        "INSERT INTO projects(name, workspace_path, config_json) VALUES (?, ?, ?)",
-        (name, workspace_path, config_to_json(cfg)),
-    )
-    conn.commit()
+    try:
+        cur = conn.execute(
+            "INSERT INTO projects(name, workspace_path, config_json) VALUES (?, ?, ?)",
+            (name, workspace_path, config_to_json(cfg)),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise StoreError(f"project {name!r} already exists") from exc
     return get_project(conn, project_id=cur.lastrowid)
 
 
@@ -174,7 +176,7 @@ def approve_epic(conn: sqlite3.Connection, epic_id: int) -> sqlite3.Row:
         )
         conn.execute(
             """
-            UPDATE tasks SET status = 'backlog', updated_at = ?, version = version + 1
+            UPDATE tasks SET status = 'backlog', updated_at = ?
             WHERE epic_id = ? AND status = 'draft'
             """,
             (now, epic_id),
@@ -270,7 +272,11 @@ def create_task(
     if status not in TASK_STATUSES:
         raise StoreError(f"invalid task status: {status}")
     if epic_id is not None:
-        get_epic(conn, epic_id)
+        epic = get_epic(conn, epic_id)
+        if epic["project_id"] != project_id:
+            raise StoreError(
+                f"epic {format_epic_id(epic_id)} belongs to a different project"
+            )
     now = _now()
     blocked_json = json.dumps(blocked_by or [])
     cur = conn.execute(
@@ -343,10 +349,19 @@ def update_task_from_edit(
     priority: int,
     blocked_by: list[int] | None,
     gate: str | None = None,
+    epic_id: Any = None,
+    version: Any = None,
+    loop_count: Any = None,
 ) -> sqlite3.Row:
     if status not in TASK_STATUSES:
         raise StoreError(f"invalid task status: {status}")
     task = get_task(conn, task_id)
+    _reject_stub_mutations(
+        task,
+        epic_id=epic_id,
+        version=version,
+        loop_count=loop_count,
+    )
     now = _now()
     conn.execute(
         """
@@ -371,6 +386,32 @@ def update_task_from_edit(
     )
     conn.commit()
     return get_task(conn, task_id)
+
+
+def _reject_stub_mutations(
+    task: sqlite3.Row,
+    *,
+    epic_id: Any,
+    version: Any,
+    loop_count: Any,
+) -> None:
+    """epic_id/version/loop_count are shown in the edit doc but not applied."""
+    expected = {
+        "epic_id": task["epic_id"],
+        "version": task["version"],
+        "loop_count": task["loop_count"],
+    }
+    got = {
+        "epic_id": epic_id,
+        "version": version,
+        "loop_count": loop_count,
+    }
+    for key in _EDIT_STUB_FIELDS:
+        if got[key] != expected[key]:
+            raise StoreError(
+                f"{key} is read-only in the task edit document "
+                f"(got {got[key]!r}, expected {expected[key]!r})"
+            )
 
 
 # --- status overview ---
@@ -447,12 +488,12 @@ def task_edit_document(row: sqlite3.Row) -> str:
         "stage": row["stage"],
         "role": row["role"],
         "blocked_by": blocked,
-        "epic_id": row["epic_id"],
-        "version": row["version"],
-        "loop_count": row["loop_count"],
     }
-    # drop nulls for cleaner edit
+    # drop nulls for editable fields; always emit stub fields (incl. null epic_id)
     meta = {k: v for k, v in meta.items() if v is not None}
+    meta["epic_id"] = row["epic_id"]
+    meta["version"] = row["version"]
+    meta["loop_count"] = row["loop_count"]
     fm = yaml.safe_dump(meta, default_flow_style=False, sort_keys=False)
     return f"---\n{fm}---\n\n{row['body']}"
 
@@ -505,4 +546,7 @@ def parse_task_edit_document(text: str) -> dict[str, Any]:
         "role": meta.get("role"),
         "priority": priority,
         "blocked_by": blocked_ids,
+        "epic_id": meta.get("epic_id"),
+        "version": meta.get("version"),
+        "loop_count": meta.get("loop_count"),
     }

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from myai.paths import teams_prompts_dir
+from myai.paths import teams_prompts_dir, teams_root
 
 EPIC_STATUSES = frozenset(
     {
@@ -56,8 +57,30 @@ class ConfigError(ValueError):
 
 
 def prompt_path(name: str) -> str:
-    """Absolute path string for a prompt under the XDG prompts dir."""
-    return str(teams_prompts_dir() / name)
+    """Relative path for a stock prompt under the teams state root."""
+    return f"prompts/{name}"
+
+
+def resolve_prompt_path(
+    path: str | Path, *, workspace_path: str | Path | None = None
+) -> Path:
+    """Resolve a roster prompt path to an absolute Path.
+
+    Absolute paths are used as-is. Paths under ``.myai/`` resolve against
+    ``workspace_path``. Everything else is relative to ``teams_root()``
+    (so ``prompts/pm.md`` → XDG ``…/teams/prompts/pm.md``).
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    text = p.as_posix()
+    if text.startswith(".myai/") or text == ".myai":
+        if workspace_path is None:
+            raise ConfigError(
+                f"prompt path {text!r} is project-local; workspace_path required"
+            )
+        return (Path(workspace_path) / p).resolve()
+    return (teams_root() / p).resolve()
 
 
 def default_roster() -> dict[str, Any]:
@@ -147,15 +170,42 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     pipeline = config.get("pipeline")
     if not isinstance(pipeline, list) or not pipeline:
         raise ConfigError("pipeline must be a non-empty list")
+    stage_names: list[str] = []
     for i, stage in enumerate(pipeline):
         if not isinstance(stage, dict):
             raise ConfigError(f"pipeline[{i}] must be a mapping")
-        if not stage.get("stage"):
+        name = stage.get("stage")
+        if not name:
             raise ConfigError(f"pipeline[{i}].stage is required")
+        if not isinstance(name, str):
+            raise ConfigError(f"pipeline[{i}].stage must be a string")
+        if name in stage_names:
+            raise ConfigError(f"duplicate pipeline stage: {name!r}")
+        stage_names.append(name)
         gate = stage.get("gate")
         if gate is not None and gate not in GATE_VALUES:
             raise ConfigError(
                 f"pipeline[{i}].gate must be one of {sorted(GATE_VALUES)}"
+            )
+        role = stage.get("role")
+        if role is not None:
+            if not isinstance(role, str):
+                raise ConfigError(f"pipeline[{i}].role must be a string")
+            if role not in roster:
+                raise ConfigError(
+                    f"pipeline[{i}].role {role!r} is not in roster"
+                )
+
+    stage_set = set(stage_names)
+    for i, stage in enumerate(pipeline):
+        on_fail = stage.get("on_fail")
+        if on_fail is None:
+            continue
+        if not isinstance(on_fail, str):
+            raise ConfigError(f"pipeline[{i}].on_fail must be a string")
+        if on_fail not in stage_set:
+            raise ConfigError(
+                f"pipeline[{i}].on_fail {on_fail!r} is not a pipeline stage"
             )
 
     conc = config.get("concurrency")
@@ -163,8 +213,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("concurrency must be a mapping")
     if isinstance(conc, dict):
         per = conc.get("per_stage")
-        if per is not None and not isinstance(per, dict):
-            raise ConfigError("concurrency.per_stage must be a mapping")
+        if per is not None:
+            if not isinstance(per, dict):
+                raise ConfigError("concurrency.per_stage must be a mapping")
+            for stage_name, limit in per.items():
+                if not isinstance(limit, int):
+                    raise ConfigError(
+                        f"concurrency.per_stage.{stage_name} must be an int"
+                    )
         if "pm" in conc and not isinstance(conc["pm"], int):
             raise ConfigError("concurrency.pm must be an int")
         if "max_total" in conc and conc["max_total"] is not None:
@@ -207,8 +263,9 @@ def config_from_json(text: str) -> dict[str, Any]:
     return validate_config(data)
 
 
-def bundled_prompts_dir() -> Path:
-    return Path(__file__).resolve().parent / "prompts"
+def bundled_prompts_dir():
+    """Traversable for packaged prompt seeds (importlib.resources)."""
+    return resources.files("myai.teams.prompts")
 
 
 def install_default_prompts(*, overwrite: bool = False) -> list[Path]:
@@ -223,7 +280,7 @@ def install_default_prompts(*, overwrite: bool = False) -> list[Path]:
         if dest.exists() and not overwrite:
             continue
         if not src.is_file():
-            raise ConfigError(f"missing bundled prompt: {src}")
+            raise ConfigError(f"missing bundled prompt: {name}")
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         written.append(dest)
     return written
