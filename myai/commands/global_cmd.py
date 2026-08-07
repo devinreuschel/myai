@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from myai.agentsync.config import AGENTS
+from myai.agentsync.config import ConfigError, normalize_agents
 from myai.agentsync.global_config import (
     GlobalSyncConfig,
     config_exists,
@@ -16,6 +16,7 @@ from myai.agentsync.global_sync import (
     print_global_sync_result,
     sync_global,
 )
+from myai.agentsync.master import normalize_name_list
 from myai.agentsync.registry import get_master
 from myai.paths import global_sync_config_path
 
@@ -34,6 +35,8 @@ CLOBBER_WARNING = """\
 WARNING: the following paths already exist and are not tracked by myai.
 Syncing will overwrite them (skill dirs are replaced entirely):
 """
+
+_SELECT_HELP = "repeatable or comma-separated; use 'all' for everything"
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -56,29 +59,28 @@ def _register_init(subparsers: argparse._SubParsersAction) -> None:
         "--agent",
         action="append",
         dest="agents",
-        choices=AGENTS,
-        help="Agent home to manage (repeatable; default: all)",
+        help=f"Agent home to manage ({_SELECT_HELP}; default: all)",
     )
     parser.add_argument(
         "--rule",
         action="append",
         dest="rules",
         default=[],
-        help="Rule name from master (repeatable)",
+        help=f"Rule name from master ({_SELECT_HELP})",
     )
     parser.add_argument(
         "--skill",
         action="append",
         dest="skills",
         default=[],
-        help="Skill name from master (repeatable)",
+        help=f"Skill name from master ({_SELECT_HELP})",
     )
     parser.add_argument(
         "--subagent",
         action="append",
         dest="subagents",
         default=[],
-        help="Subagent name from master (repeatable)",
+        help=f"Subagent name from master ({_SELECT_HELP})",
     )
     parser.add_argument(
         "--flat-rules",
@@ -149,12 +151,17 @@ def run_init(args: argparse.Namespace) -> int:
             print("aborted")
             return 1
 
-    agents = args.agents if args.agents else list(AGENTS)
+    try:
+        agents = normalize_agents(args.agents)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     cfg = GlobalSyncConfig(
         agents=agents,
-        rules=args.rules or [],
-        skills=args.skills or [],
-        subagents=args.subagents or [],
+        rules=normalize_name_list(args.rules or []),
+        skills=normalize_name_list(args.skills or []),
+        subagents=normalize_name_list(args.subagents or []),
         nested_rules=not args.flat_rules,
         inject_myai_rule=False if args.no_myai_rule else None,
     )

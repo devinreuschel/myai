@@ -88,8 +88,12 @@ materializes them into user-global agent homes. Prune state lives at
 | pi | `~/.pi/agent` (or `PI_CODING_AGENT_DIR`) | `skills/<name>/` | managed block in `AGENTS.md` | — | `APPEND_SYSTEM.md` |
 
 Flags match per-repo init (`--agent`, `--rule`, `--skill`, `--subagent`,
-`--flat-rules`, `--no-myai-rule`). Re-run `global init` to replace the
-selection; `global sync` applies and prunes tracked files only.
+`--flat-rules`, `--no-myai-rule`). Selection flags accept repeated values or
+comma-separated lists (`--rule langs,general`); `all` selects the full master
+catalog for that kind (stored as `"all"` and resolved on each sync; dir
+selectors like `langs` still expand). Empty lists sync nothing. Re-run
+`global init` to replace the selection; `global sync` applies and prunes
+tracked files only.
 
 **Clobber safety:** before writing, sync detects paths that already exist and
 are not in global state (untracked user content). Those are listed as conflicts.

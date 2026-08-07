@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from myai.agentsync.master import expand_csv_list
 from myai.global_config import get_inject_myai_rule_default
 
 CONFIG_VERSION = 1
@@ -14,6 +15,19 @@ AGENTS = ("cursor", "claude", "pi")
 
 class ConfigError(Exception):
     pass
+
+
+def normalize_agents(values: list[str] | None) -> list[str]:
+    """Expand CSV agent flags; omit/empty/'all' → all agents."""
+    if not values:
+        return list(AGENTS)
+    names = expand_csv_list(values)
+    if not names or "all" in names:
+        return list(AGENTS)
+    for name in names:
+        if name not in AGENTS:
+            raise ConfigError(f"unknown agent {name!r}, expected one of {AGENTS}")
+    return names
 
 
 @dataclass

@@ -206,12 +206,45 @@ def load_subagent(master: Path, name: str) -> Subagent:
     return Subagent(name=name, path=path, frontmatter=fm, body=body.strip())
 
 
+def expand_csv_list(values: list[str]) -> list[str]:
+    """Split comma-delimited entries; strip, drop empties, order-preserving dedupe."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for part in value.split(","):
+            name = part.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def normalize_name_list(values: list[str]) -> list[str]:
+    """Expand CSV lists; if any token is 'all', return ['all']."""
+    names = expand_csv_list(values)
+    if "all" in names:
+        return ["all"]
+    return names
+
+
 def resolve_selection(
     master: Path,
     rule_names: list[str],
     skill_names: list[str],
     subagent_names: list[str],
 ) -> tuple[list[Rule], list[Skill], list[Subagent]]:
+    rule_names = normalize_name_list(rule_names)
+    skill_names = normalize_name_list(skill_names)
+    subagent_names = normalize_name_list(subagent_names)
+
+    if rule_names == ["all"]:
+        rule_names = list_rules(master)
+    if skill_names == ["all"]:
+        skill_names = list_skills(master)
+    if subagent_names == ["all"]:
+        subagent_names = list_subagents(master)
+
     rules: list[Rule] = []
     seen: set[str] = set()
     for sel in rule_names:

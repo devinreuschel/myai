@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `myai global init|sync|status`: sync selected master rules/skills/subagents into user-global agent homes (`~/.claude`, `~/.cursor`, `~/.pi/agent`), with selection in `~/.myai/global.json` and prune state under XDG; independent of per-repo `myai sync`. Cursor global rules are unsupported (skills only). Sync refuses to overwrite untracked existing home files unless the user confirms or passes `-y`.
+- Init selection flags (`--agent`, `--rule`, `--skill`, `--subagent`) on `myai init` and `myai global init` accept comma-separated values (`--rule a,b`) in addition to repeated flags; `all` selects the full master catalog for that kind (rules/skills/subagents store `"all"` and resolve on each sync; agents expand at init)
 - myai-managed guardrail: when enabled (default), injects instructions not to edit synced rules/skills/subagents directly; cursor/claude get an always-apply rule (nested file or managed block), pi gets `.pi/APPEND_SYSTEM.md` via `myai sync`, non-pi managed repos also get `/root/.pi/agent/APPEND_SYSTEM.md` at VM boot
 - Global user settings in `~/.myai/config.json` (alongside `~/.myai/sandbox.json`); `inject_myai_rule` lives here
 - `myai config myai-rule [on|off]` to show or set the global default for the myai-managed guardrail
