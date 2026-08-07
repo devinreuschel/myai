@@ -74,6 +74,36 @@ the repo's `.myai/config.json`:
 This lets cursor-only (or claude-only) managed repos run sandboxed `pi` with the
 same rule set without duplicating rules when the repo already syncs for pi.
 
+### Global agent home sync
+
+Separate from per-repo sync: `myai global init` writes `~/.myai/global.json`
+(which agents + which master rules/skills/subagents), then `myai global sync`
+materializes them into user-global agent homes. Prune state lives at
+`$XDG_DATA_HOME/myai/global-state.json` (or `$MYAI_HOME/global-state.json`).
+
+| Agent | Root | Skills | Rules | Subagents | Guardrail |
+|-------|------|--------|-------|-----------|-----------|
+| claude | `~/.claude` (or `CLAUDE_CONFIG_DIR`) | `skills/<name>/` | nested `rules/<name>.md` or managed block in `CLAUDE.md` | `agents/<name>.md` | nested rule or flat section |
+| cursor | `~/.cursor` | `skills/<name>/` | unsupported (User Rules are not file-backed) | — | — |
+| pi | `~/.pi/agent` (or `PI_CODING_AGENT_DIR`) | `skills/<name>/` | managed block in `AGENTS.md` | — | `APPEND_SYSTEM.md` |
+
+Flags match per-repo init (`--agent`, `--rule`, `--skill`, `--subagent`,
+`--flat-rules`, `--no-myai-rule`). Selection flags accept repeated values or
+comma-separated lists (`--rule langs,general`); `all` selects the full master
+catalog for that kind (stored as `"all"` and resolved on each sync; dir
+selectors like `langs` still expand). Empty lists sync nothing. Re-run
+`global init` to replace the selection; `global sync` applies and prunes
+tracked files only.
+
+**Clobber safety:** before writing, sync detects paths that already exist and
+are not in global state (untracked user content). Those are listed as conflicts.
+`myai global sync` prompts to confirm overwrite (or use `-y`); without
+confirmation it aborts and writes nothing. Managed-block injection into
+`CLAUDE.md`/`AGENTS.md` is additive (myai begin/end markers) and is not treated
+as a clobber conflict. Untracked content that already matches master is adopted
+into state without a prompt; for skill dirs that means every file matches, since
+the sync replaces the whole tree and would wipe anything extra.
+
 ## Agent sandbox: phasing and escape hatches
 
 We run interactive `pi` inside a microVM so it feels like plain `pi` but the

@@ -13,9 +13,13 @@ Central repo for rules, skills, and subagents synced to managed repos (cursor, c
 ```bash
 myai master init              # scaffold master repo dirs
 myai init --agent cursor --rule general   # per-repo config
+myai init --rule langs,general --skill all   # CSV lists; 'all' = entire catalog
 myai init --flat-rules        # flatten rules into AGENTS.md/CLAUDE.md
 myai sync                     # apply rules/skills to agent-native paths
 myai status                   # drift summary
+myai global init --agent claude --skill demo   # user-home selection
+myai global sync              # apply to ~/.claude, ~/.cursor, ~/.pi/agent
+myai global status
 ```
 
 Config lives in `.myai/config.json`. Key fields:
@@ -23,10 +27,14 @@ Config lives in `.myai/config.json`. Key fields:
 | Field | Default | Purpose |
 |-------|---------|---------|
 | `agents` | all three | which tools to sync (`cursor`, `claude`, `pi`) |
-| `rules` | `[]` | rule selectors from master repo |
+| `rules` | `[]` | rule selectors from master repo (`all` = every top-level rule/dir) |
 | `nested_rules` | `true` | nested rule files vs flattened blocks |
 
+`--agent` / `--rule` / `--skill` / `--subagent` accept repeated flags or comma-separated values (`--rule a,b`). Dir selectors like `langs` still expand to that directory's rules. Empty lists sync nothing; `all` syncs the full master catalog for that kind (resolved on each sync).
+
 With `nested_rules: true` (default), cursor writes `.cursor/rules/*.mdc` and claude writes `.claude/rules/*.md`; pi always flattens to `AGENTS.md`. With `nested_rules: false`, cursor and claude flatten too (cursor+pi share `AGENTS.md`). See [docs/DESIGN.md](docs/DESIGN.md) for details.
+
+User-global sync (`myai global`) is a separate plane: selection in `~/.myai/global.json`, writes into agent homes so skills/rules apply across projects. Cursor global rules are not file-backed; only skills sync for cursor. Sync prompts before overwriting untracked files already in those homes (`-y` to confirm non-interactively).
 
 ## Requirements
 
