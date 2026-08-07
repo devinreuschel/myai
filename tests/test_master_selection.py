@@ -8,7 +8,10 @@ from unittest.mock import patch
 from myai.agentsync.config import ConfigError, AGENTS, load_config, normalize_agents
 from myai.agentsync.global_config import load_global_sync_config
 from myai.agentsync.master import (
+    MasterError,
     expand_csv_list,
+    load_skill,
+    load_subagent,
     normalize_name_list,
     resolve_selection,
 )
@@ -133,6 +136,32 @@ class TestResolveSelection(unittest.TestCase):
         _, skills, subs = resolve_selection(self.master, [], ["all"], ["all"])
         self.assertEqual(sorted(s.name for s in skills), ["demo", "other"])
         self.assertEqual(sorted(s.name for s in subs), ["reviewer", "tester"])
+
+    def test_skill_name_traversal_rejected(self) -> None:
+        # A traversal name would otherwise render to home/skills/../../x and
+        # escape the agent home entirely. Real target, so "not found" can't be
+        # what saves us here.
+        outside = self.master.parent / "outside-skill"
+        outside.mkdir()
+        (outside / "SKILL.md").write_text("# pwned\n", encoding="utf-8")
+        for bad in ["../../outside-skill", "../other", "/abs/skill", "sub/dir", "..", ""]:
+            with self.assertRaises(MasterError):
+                load_skill(self.master, bad)
+
+    def test_subagent_name_traversal_rejected(self) -> None:
+        for bad in ["../rules/general", "../../outside", "/abs/sub", "sub/dir", ".."]:
+            with self.assertRaises(MasterError):
+                load_subagent(self.master, bad)
+
+    def test_valid_names_still_load(self) -> None:
+        self.assertEqual(load_skill(self.master, "demo").name, "demo")
+        self.assertEqual(load_subagent(self.master, "reviewer").name, "reviewer")
+
+    def test_traversal_via_selection_rejected(self) -> None:
+        with self.assertRaises(MasterError):
+            resolve_selection(self.master, [], ["../../outside"], [])
+        with self.assertRaises(MasterError):
+            resolve_selection(self.master, [], [], ["../rules/general"])
 
     def test_empty_means_nothing(self) -> None:
         rules, skills, subs = resolve_selection(self.master, [], [], [])

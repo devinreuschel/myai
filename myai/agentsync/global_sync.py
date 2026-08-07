@@ -1,8 +1,10 @@
+import posixpath
 import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from myai.agentsync.config import ConfigError
 from myai.agentsync.global_config import (
     GlobalSyncConfig,
     GlobalSyncState,
@@ -51,7 +53,32 @@ class GlobalSyncPlan:
 
 def _home_for_key(key: str) -> tuple[str, Path, str]:
     agent, rel = parse_state_key(key)
+    # Every home path is built from here, so validate traversal once, lexically.
+    # Lexical (not resolve()) so legitimately symlinked agent homes still work.
+    norm = posixpath.normpath(rel)
+    if posixpath.isabs(norm) or norm == "." or norm == ".." or norm.startswith("../"):
+        raise GlobalSyncError(f"unsafe global sync path {rel!r}")
     return agent, agent_home(agent), rel
+
+
+def _home_for_state_key(key: str) -> tuple[str, Path, str] | None:
+    """Like _home_for_key but tolerates junk in a hand-edited state file.
+
+    Returns None for keys we refuse to touch, so a bad key gets dropped from
+    state instead of wedging every future sync.
+    """
+    try:
+        return _home_for_key(key)
+    except (GlobalSyncError, ConfigError, ValueError):
+        return None
+
+
+def _clear_dest(path: Path) -> None:
+    """Clear whatever is at path so a regular file can be written there."""
+    if path.is_symlink():
+        path.unlink()  # don't write through the link into its target
+    elif path.is_dir():
+        shutil.rmtree(path)
 
 
 def _read_existing(home: Path, rel: str) -> str:
@@ -59,18 +86,6 @@ def _read_existing(home: Path, rel: str) -> str:
     if path.is_file():
         return path.read_text(encoding="utf-8")
     return ""
-
-
-def _skill_file_keys(agent: str, skill_rel: str, skill_dir: Path) -> list[str]:
-    """State keys for every file currently under an on-disk skill directory."""
-    keys: list[str] = []
-    if not skill_dir.is_dir():
-        return keys
-    for path in sorted(skill_dir.rglob("*")):
-        if path.is_file():
-            rel = f"{skill_rel}/{path.relative_to(skill_dir).as_posix()}"
-            keys.append(state_key(agent, rel))
-    return keys
 
 
 def detect_clobber_conflicts(
@@ -88,32 +103,39 @@ def detect_clobber_conflicts(
         path = home / rel
 
         if rendered.content is not None:
-            if not path.is_file():
+            # is_symlink covers dangling links, which would write to their target.
+            if not path.exists() and not path.is_symlink():
                 continue
             if key in old_state.files:
                 continue
-            new_hash = sha256_text(rendered.content)
-            if sha256_file(path) != new_hash:
-                conflicts.append(key)
+            if path.is_file() and sha256_file(path) == sha256_text(rendered.content):
+                continue  # identical content, adopt it
+            conflicts.append(key)
             continue
 
         if rendered.source_dir is None:
             continue
 
         # Skill dir copy replaces the whole tree (rmtree + copytree).
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             continue
-        if path.is_file():
+        if not path.is_dir() or path.is_symlink():
             conflicts.append(key)
-            continue
-        if not path.is_dir():
             continue
 
-        existing_keys = _skill_file_keys(agent, rel, path)
-        if not existing_keys:
-            continue
-        if any(k not in old_state.files for k in existing_keys):
+        planned = collect_skill_files(rendered.source_dir, rel)
+        for existing in sorted(path.rglob("*")):
+            if not existing.is_file():
+                continue
+            existing_rel = f"{rel}/{existing.relative_to(path).as_posix()}"
+            if state_key(agent, existing_rel) in old_state.files:
+                continue
+            # Untracked file is only safe if master has identical content there;
+            # anything else (extra file, different content) gets wiped.
+            if planned.get(existing_rel) == sha256_file(existing):
+                continue
             conflicts.append(key)
+            break
 
     return sorted(set(conflicts))
 
@@ -169,15 +191,29 @@ def compute_global_sync(
                 actions.append(SyncAction("write", key))
             new_state.files[key] = new_hash
         elif rendered.source_dir is not None:
+            agent = parse_state_key(key)[0]
             skill_hashes = collect_skill_files(rendered.source_dir, rel)
             changed = False
             for skill_rel, h in skill_hashes.items():
-                skill_key = state_key(parse_state_key(key)[0], skill_rel)
+                skill_key = state_key(agent, skill_rel)
                 path = home / skill_rel
                 old_hash = sha256_file(path) if path.is_file() else None
                 if old_hash != h:
                     changed = True
                 new_state.files[skill_key] = h
+            # The tree replace also wipes on-disk files master no longer has, so
+            # those count as a change even when every master file already matches.
+            dest = home / rel
+            if dest.is_dir() and not dest.is_symlink():
+                for existing in dest.rglob("*"):
+                    if not existing.is_file():
+                        continue
+                    existing_rel = f"{rel}/{existing.relative_to(dest).as_posix()}"
+                    if existing_rel not in skill_hashes:
+                        changed = True
+                        break
+            elif dest.exists() or dest.is_symlink():
+                changed = True
             if changed:
                 actions.append(SyncAction("write", key, "sync skill directory"))
 
@@ -202,49 +238,67 @@ def apply_global_sync(sync_plan: GlobalSyncPlan, old_state: GlobalSyncState) -> 
     blocks = sync_plan.blocks
     new_state = sync_plan.new_state
 
-    for key, block_content in blocks.items():
-        _, home, rel = _home_for_key(key)
-        path = home / rel
-        existing = _read_existing(home, rel)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inject_block(existing, block_content), encoding="utf-8")
-
-    for key in old_state.blocks:
-        if key not in blocks:
+    # Track what actually landed; a failure part way through must not leave
+    # written files untracked or deleted files still tracked.
+    applied = GlobalSyncState(files=dict(old_state.files), blocks=dict(old_state.blocks))
+    try:
+        for key, block_content in blocks.items():
             _, home, rel = _home_for_key(key)
             path = home / rel
-            if path.is_file():
-                existing = path.read_text(encoding="utf-8")
-                path.write_text(inject_block(existing, ""), encoding="utf-8")
-
-    for key, rendered in files.items():
-        _, home, rel = _home_for_key(key)
-        path = home / rel
-        if rendered.content is not None:
+            existing = _read_existing(home, rel)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(rendered.content, encoding="utf-8")
-        elif rendered.source_dir is not None:
-            copy_skill_dir(rendered.source_dir, path)
+            path.write_text(inject_block(existing, block_content), encoding="utf-8")
+            applied.blocks[key] = True
 
-    skill_dirs: set[Path] = set()
-    for key in old_state.files:
-        if key in new_state.files:
-            continue
-        _, home, rel = _home_for_key(key)
-        path = home / rel
-        if path.is_file():
-            path.unlink()
-            parts = Path(rel).parts
-            if len(parts) >= 2 and parts[0] == "skills":
-                skill_dirs.add(home / parts[0] / parts[1])
-        elif path.is_dir():
-            shutil.rmtree(path)
+        for key in old_state.blocks:
+            if key not in blocks:
+                resolved = _home_for_state_key(key)
+                if resolved is not None:
+                    _, home, rel = resolved
+                    path = home / rel
+                    if path.is_file():
+                        existing = path.read_text(encoding="utf-8")
+                        path.write_text(inject_block(existing, ""), encoding="utf-8")
+                applied.blocks.pop(key, None)
 
-    for skill_path in skill_dirs:
-        if skill_path.is_dir() and not any(p.is_file() for p in skill_path.rglob("*")):
-            shutil.rmtree(skill_path)
+        for key, rendered in files.items():
+            agent, home, rel = _home_for_key(key)
+            path = home / rel
+            if rendered.content is not None:
+                _clear_dest(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(rendered.content, encoding="utf-8")
+                if key in new_state.files:
+                    applied.files[key] = new_state.files[key]
+            elif rendered.source_dir is not None:
+                copy_skill_dir(rendered.source_dir, path)
+                for skill_rel, h in collect_skill_files(rendered.source_dir, rel).items():
+                    applied.files[state_key(agent, skill_rel)] = h
 
-    save_global_sync_state(new_state)
+        skill_dirs: set[Path] = set()
+        for key in old_state.files:
+            if key in new_state.files:
+                continue
+            resolved = _home_for_state_key(key)
+            if resolved is None:
+                applied.files.pop(key, None)
+                continue
+            _, home, rel = resolved
+            path = home / rel
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+                parts = Path(rel).parts
+                if len(parts) >= 2 and parts[0] == "skills":
+                    skill_dirs.add(home / parts[0] / parts[1])
+            elif path.is_dir():
+                shutil.rmtree(path)
+            applied.files.pop(key, None)
+
+        for skill_path in skill_dirs:
+            if skill_path.is_dir() and not any(p.is_file() for p in skill_path.rglob("*")):
+                shutil.rmtree(skill_path)
+    finally:
+        save_global_sync_state(applied)
 
 
 def sync_global(dry_run: bool = False, allow_clobber: bool = False) -> GlobalSyncResult:
@@ -265,7 +319,9 @@ def sync_global(dry_run: bool = False, allow_clobber: bool = False) -> GlobalSyn
             )
             return result
 
-        if not dry_run and sync_plan.actions:
+        # State can change with no file actions (adopting identical untracked
+        # content), so don't gate apply on actions alone.
+        if not dry_run and (sync_plan.actions or sync_plan.new_state != old_state):
             apply_global_sync(sync_plan, old_state)
         return result
     except (GlobalSyncError, MasterError) as exc:

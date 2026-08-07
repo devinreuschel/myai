@@ -96,7 +96,7 @@ def _register_init(subparsers: argparse._SubParsersAction) -> None:
         "-y",
         "--yes",
         action="store_true",
-        help="Skip overwrite confirmation",
+        help="Skip the confirmation for letting myai manage agent homes",
     )
     parser.set_defaults(func=run_init)
 

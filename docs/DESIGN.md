@@ -100,8 +100,9 @@ are not in global state (untracked user content). Those are listed as conflicts.
 `myai global sync` prompts to confirm overwrite (or use `-y`); without
 confirmation it aborts and writes nothing. Managed-block injection into
 `CLAUDE.md`/`AGENTS.md` is additive (myai begin/end markers) and is not treated
-as a clobber conflict. Identical untracked file content is adopted without a
-prompt.
+as a clobber conflict. Untracked content that already matches master is adopted
+into state without a prompt; for skill dirs that means every file matches, since
+the sync replaces the whole tree and would wipe anything extra.
 
 ## Agent sandbox: phasing and escape hatches
 

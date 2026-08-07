@@ -10,6 +10,7 @@ from myai.agentsync.global_config import (
     load_global_sync_config,
     load_global_sync_state,
     save_global_sync_config,
+    save_global_sync_state,
 )
 from myai.agentsync.global_homes import (
     CURSOR_RULES_WARNING,
@@ -18,11 +19,14 @@ from myai.agentsync.global_homes import (
     build_global_plan,
 )
 from myai.agentsync.global_sync import (
+    GlobalSyncError,
+    _home_for_key,
     apply_global_sync,
     compute_global_sync,
     sync_global,
 )
 from myai.agentsync.master import Frontmatter, Rule, Skill, Subagent
+from myai.agentsync.render import copy_skill_dir as real_copy_skill_dir
 from myai.agentsync.registry import set_master
 from myai.cli import main
 
@@ -322,6 +326,30 @@ class TestGlobalSyncIntegration(unittest.TestCase):
         self.assertTrue((skill_dir / "SKILL.md").is_file())
         self.assertFalse((skill_dir / "notes.txt").exists())
 
+    def test_skill_conflict_with_identical_content_still_clobbers(self) -> None:
+        """-y must wipe untracked extras even when every master file matches."""
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], skills=["demo"], inject_myai_rule=False)
+        )
+        skill_dir = self.home / "claude" / "skills" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Demo skill\n", encoding="utf-8")
+        (skill_dir / "notes.txt").write_text("untracked extra\n", encoding="utf-8")
+
+        plan = compute_global_sync(load_global_sync_config(), GlobalSyncState())
+        self.assertIn("claude:skills/demo", plan.conflicts)
+        # No hash differs, but the tree replace still removes notes.txt.
+        self.assertTrue(any(a.path == "claude:skills/demo" for a in plan.actions))
+
+        blocked = sync_global(allow_clobber=False)
+        self.assertIsNotNone(blocked.error)
+        self.assertTrue((skill_dir / "notes.txt").is_file())
+
+        ok = sync_global(allow_clobber=True)
+        self.assertIsNone(ok.error)
+        self.assertTrue((skill_dir / "SKILL.md").is_file())
+        self.assertFalse((skill_dir / "notes.txt").exists())
+
     def test_identical_untracked_file_is_not_conflict(self) -> None:
         save_global_sync_config(
             GlobalSyncConfig(
@@ -341,6 +369,113 @@ class TestGlobalSyncIntegration(unittest.TestCase):
 
         result = sync_global(allow_clobber=False)
         self.assertIsNone(result.error)
+
+    def test_identical_untracked_file_is_adopted_into_state(self) -> None:
+        """Adoption must persist, else the next master edit demands -y."""
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], rules=["general"], inject_myai_rule=False)
+        )
+        plan = compute_global_sync(load_global_sync_config(), GlobalSyncState())
+        content = plan.files["claude:rules/general.md"].content or ""
+        target = self.home / "claude" / "rules" / "general.md"
+        target.parent.mkdir(parents=True)
+        target.write_text(content, encoding="utf-8")
+
+        self.assertIsNone(sync_global(allow_clobber=False).error)
+        self.assertIn("claude:rules/general.md", load_global_sync_state().files)
+
+        # Now that it's tracked, a master change applies without a clobber prompt.
+        (self.master / "rules" / "general.md").write_text(
+            "---\ndescription: General\n---\nBe nicer.\n",
+            encoding="utf-8",
+        )
+        result = sync_global(allow_clobber=False)
+        self.assertIsNone(result.error)
+        self.assertIn("Be nicer.", target.read_text(encoding="utf-8"))
+
+    def test_identical_untracked_skill_dir_is_adopted(self) -> None:
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], skills=["demo"], inject_myai_rule=False)
+        )
+        skill_dir = self.home / "claude" / "skills" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Demo skill\n", encoding="utf-8")
+
+        plan = compute_global_sync(load_global_sync_config(), GlobalSyncState())
+        self.assertEqual(plan.conflicts, [])
+        self.assertIsNone(sync_global(allow_clobber=False).error)
+        self.assertIn("claude:skills/demo/SKILL.md", load_global_sync_state().files)
+
+    def test_dir_where_file_expected_is_conflict(self) -> None:
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], rules=["general"], inject_myai_rule=False)
+        )
+        target = self.home / "claude" / "rules" / "general.md"
+        target.mkdir(parents=True)
+        (target / "surprise.txt").write_text("dir not file\n", encoding="utf-8")
+
+        plan = compute_global_sync(load_global_sync_config(), GlobalSyncState())
+        self.assertIn("claude:rules/general.md", plan.conflicts)
+
+        blocked = sync_global(allow_clobber=False)
+        self.assertIsNotNone(blocked.error)
+        self.assertTrue(target.is_dir())
+
+        ok = sync_global(allow_clobber=True)
+        self.assertIsNone(ok.error)
+        self.assertTrue(target.is_file())
+        self.assertIn("Be nice.", target.read_text(encoding="utf-8"))
+
+    def test_unsafe_rel_never_resolves_against_home(self) -> None:
+        with self.assertRaises(GlobalSyncError):
+            _home_for_key("claude:../../escaped.md")
+        with self.assertRaises(GlobalSyncError):
+            _home_for_key("claude:skills/../../escaped")
+
+    def test_unsafe_state_key_is_dropped_not_wedged(self) -> None:
+        """A hand-edited state key must not delete outside the home or wedge sync."""
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], rules=["general"], inject_myai_rule=False)
+        )
+        outside = self.home / "escaped.md"
+        outside.write_text("user file outside the agent home\n", encoding="utf-8")
+        save_global_sync_state(GlobalSyncState(files={"claude:../escaped.md": "sha256:x"}))
+
+        result = sync_global(allow_clobber=False)
+        self.assertIsNone(result.error)
+        self.assertTrue(outside.is_file())  # never pruned through traversal
+        self.assertNotIn("claude:../escaped.md", load_global_sync_state().files)
+
+    def test_state_records_writes_when_apply_fails_midway(self) -> None:
+        (self.master / "skills" / "other").mkdir()
+        (self.master / "skills" / "other" / "SKILL.md").write_text("# Other\n", encoding="utf-8")
+        save_global_sync_config(
+            GlobalSyncConfig(
+                agents=["claude"],
+                skills=["demo", "other"],
+                inject_myai_rule=False,
+            )
+        )
+        plan = compute_global_sync(load_global_sync_config(), GlobalSyncState())
+
+        calls: list[Path] = []
+
+        def flaky(src: Path, dst: Path) -> None:
+            calls.append(src)
+            if len(calls) > 1:
+                raise RuntimeError("disk full")
+            real_copy_skill_dir(src, dst)
+
+        with patch("myai.agentsync.global_sync.copy_skill_dir", side_effect=flaky):
+            with self.assertRaises(RuntimeError):
+                apply_global_sync(plan, GlobalSyncState())
+
+        # What landed must be tracked, else the next sync flags myai's own
+        # writes as untracked user content and demands -y.
+        state = load_global_sync_state()
+        self.assertIn("claude:skills/demo/SKILL.md", state.files)
+        self.assertNotIn("claude:skills/other/SKILL.md", state.files)
+        self.assertEqual(compute_global_sync(load_global_sync_config(), state).conflicts, [])
 
     def test_tracked_files_are_not_conflicts(self) -> None:
         save_global_sync_config(
@@ -382,6 +517,21 @@ class TestGlobalSyncIntegration(unittest.TestCase):
         code = main(["global", "sync", "-y"])
         self.assertEqual(code, 0)
         self.assertIn("Be nice.", target.read_text(encoding="utf-8"))
+
+    def test_cli_sync_prompt_confirm_overwrites(self) -> None:
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], skills=["demo"], inject_myai_rule=False)
+        )
+        skill_dir = self.home / "claude" / "skills" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Demo skill\n", encoding="utf-8")
+        (skill_dir / "notes.txt").write_text("untracked extra\n", encoding="utf-8")
+
+        with patch("builtins.input", return_value="y"):
+            code = main(["global", "sync"])
+        self.assertEqual(code, 0)
+        self.assertFalse((skill_dir / "notes.txt").exists())
+        self.assertTrue((skill_dir / "SKILL.md").is_file())
 
 
 if __name__ == "__main__":

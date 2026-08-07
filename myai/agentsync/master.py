@@ -128,6 +128,14 @@ def _normalize_selector(selector: str) -> str:
     return sel
 
 
+def _validate_artifact_name(kind: str, name: str) -> str:
+    """Skill/subagent names are single path segments. No traversal, no absolutes."""
+    clean = name.strip()
+    if not clean or clean != Path(clean).name:
+        raise MasterError(f"invalid {kind} name {name!r}")
+    return clean
+
+
 def _rules_dir(master: Path) -> Path:
     return master / RULES_DIR
 
@@ -190,6 +198,7 @@ def list_subagents(master: Path) -> list[str]:
 
 
 def load_skill(master: Path, name: str) -> Skill:
+    name = _validate_artifact_name("skill", name)
     path = master / SKILLS_DIR / name
     skill_md = path / "SKILL.md"
     if not skill_md.is_file():
@@ -198,6 +207,7 @@ def load_skill(master: Path, name: str) -> Skill:
 
 
 def load_subagent(master: Path, name: str) -> Subagent:
+    name = _validate_artifact_name("subagent", name)
     path = master / SUBAGENTS_DIR / f"{name}.md"
     if not path.is_file():
         raise MasterError(f"subagent {name!r} not found at {path}")
