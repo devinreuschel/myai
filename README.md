@@ -16,6 +16,9 @@ myai init --agent cursor --rule general   # per-repo config
 myai init --flat-rules        # flatten rules into AGENTS.md/CLAUDE.md
 myai sync                     # apply rules/skills to agent-native paths
 myai status                   # drift summary
+myai global init --agent claude --skill demo   # user-home selection
+myai global sync              # apply to ~/.claude, ~/.cursor, ~/.pi/agent
+myai global status
 ```
 
 Config lives in `.myai/config.json`. Key fields:
@@ -27,6 +30,8 @@ Config lives in `.myai/config.json`. Key fields:
 | `nested_rules` | `true` | nested rule files vs flattened blocks |
 
 With `nested_rules: true` (default), cursor writes `.cursor/rules/*.mdc` and claude writes `.claude/rules/*.md`; pi always flattens to `AGENTS.md`. With `nested_rules: false`, cursor and claude flatten too (cursor+pi share `AGENTS.md`). See [docs/DESIGN.md](docs/DESIGN.md) for details.
+
+User-global sync (`myai global`) is a separate plane: selection in `~/.myai/global.json`, writes into agent homes so skills/rules apply across projects. Cursor global rules are not file-backed; only skills sync for cursor. Sync prompts before overwriting untracked files already in those homes (`-y` to confirm non-interactively).
 
 ## Requirements
 

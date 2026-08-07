@@ -1,7 +1,17 @@
 import argparse
 
 from myai import __version__
-from myai.commands import build, check, config, init_agent, master, sandbox, status, sync
+from myai.commands import (
+    build,
+    check,
+    config,
+    global_cmd,
+    init_agent,
+    master,
+    sandbox,
+    status,
+    sync,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -15,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     check.register(subparsers)
     build.register(subparsers)
     config.register(subparsers)
+    global_cmd.register(subparsers)
     init_agent.register(subparsers)
     master.register(subparsers)
     sync.register(subparsers)
