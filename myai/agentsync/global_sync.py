@@ -175,7 +175,12 @@ def compute_global_sync(
 
     for key in old_state.blocks:
         if key not in plan.blocks:
-            _, home, rel = _home_for_key(key)
+            # Tolerate junk from a hand-edited state file; apply drops the key
+            # without touching disk, so don't wedge compute (and thus status).
+            resolved = _home_for_state_key(key)
+            if resolved is None:
+                continue
+            _, home, rel = resolved
             existing = _read_existing(home, rel)
             new_content = inject_block(existing, "")
             if existing != new_content:

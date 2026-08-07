@@ -446,6 +446,31 @@ class TestGlobalSyncIntegration(unittest.TestCase):
         self.assertTrue(outside.is_file())  # never pruned through traversal
         self.assertNotIn("claude:../escaped.md", load_global_sync_state().files)
 
+    def test_unsafe_state_block_key_is_dropped_not_wedged(self) -> None:
+        """Same as above for blocks: a bad key must not wedge sync/status."""
+        save_global_sync_config(
+            GlobalSyncConfig(agents=["claude"], rules=["general"], inject_myai_rule=False)
+        )
+        outside = self.home / "escaped.md"
+        outside.write_text("user file outside the agent home\n", encoding="utf-8")
+        save_global_sync_state(
+            GlobalSyncState(blocks={"claude:../escaped.md": True, "bogus-key": True})
+        )
+
+        plan = compute_global_sync(load_global_sync_config(), load_global_sync_state())
+        self.assertFalse(any("escaped" in a.path for a in plan.actions))
+
+        result = sync_global(allow_clobber=False)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            outside.read_text(encoding="utf-8"),
+            "user file outside the agent home\n",
+        )
+        state = load_global_sync_state()
+        self.assertNotIn("claude:../escaped.md", state.blocks)
+        self.assertNotIn("bogus-key", state.blocks)
+        self.assertEqual(main(["global", "status"]), 0)
+
     def test_state_records_writes_when_apply_fails_midway(self) -> None:
         (self.master / "skills" / "other").mkdir()
         (self.master / "skills" / "other" / "SKILL.md").write_text("# Other\n", encoding="utf-8")
