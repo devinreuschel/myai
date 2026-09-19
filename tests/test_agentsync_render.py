@@ -23,7 +23,7 @@ from myai.agentsync.render import (
     render_claude_rule,
     render_cursor_rule,
 )
-from myai.agentsync.sync import apply_sync, compute_sync
+from myai.agentsync.sync import UnsafePathError, apply_sync, compute_sync, sync_repo
 from myai.global_config import (
     get_inject_myai_rule_default,
     load_global_config,
@@ -436,6 +436,154 @@ class TestMyaiManagedRule(unittest.TestCase):
         self.assertTrue(get_inject_myai_rule_default())
         self.assertNotIn("inject_myai_rule", load())
         self.assertTrue(global_config_path().is_file())
+
+
+class TestSyncUntrustedRepo(unittest.TestCase):
+    """.myai/state.json and the working tree come with the clone; sync must not
+    let them reach outside the repo or outside the dirs sync manages."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.tmp = Path(self._tmp.name).resolve()
+        self._config_dir = self.tmp / ".myai"
+        self._config_dir.mkdir()
+        self._old_home = os.environ.get("MYAI_HOME")
+        os.environ["MYAI_HOME"] = str(self.tmp / "state")
+        self._patch = patch("myai.paths.global_myai_dir", return_value=self._config_dir)
+        self._patch.start()
+
+        master = self.tmp / "master"
+        (master / "rules").mkdir(parents=True)
+        (master / "rules" / "general.md").write_text("General rule\n", encoding="utf-8")
+        set_master(master)
+
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        save_config(self.repo, RepoConfig(agents=["claude"], rules=["general"]))
+
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        (self.outside / "keep.txt").write_text("keep", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._patch.stop()
+        if self._old_home is None:
+            os.environ.pop("MYAI_HOME", None)
+        else:
+            os.environ["MYAI_HOME"] = self._old_home
+        self._tmp.cleanup()
+
+    def _write_state(self, files: dict, blocks: dict | None = None) -> None:
+        state = {"files": files, "blocks": blocks or {}}
+        (self.repo / ".myai" / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    def test_state_traversal_and_absolute_paths_are_not_deleted(self) -> None:
+        self._write_state({"../outside": "x", str(self.outside): "y"})
+        result = sync_repo(self.repo)
+
+        self.assertIsNone(result.error)
+        self.assertTrue((self.outside / "keep.txt").is_file())
+        self.assertEqual(len(result.warnings), 2)
+        self.assertFalse([a for a in result.actions if a.kind == "delete"])
+
+    def test_state_cannot_delete_unmanaged_repo_paths(self) -> None:
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.py").write_text("code", encoding="utf-8")
+        mine = self.repo / ".claude" / "skills" / "mine"
+        mine.mkdir(parents=True)
+        (mine / "SKILL.md").write_text("mine", encoding="utf-8")
+        # in the repo but not ours, and a managed dir itself rather than a file in it
+        self._write_state({"src": "x", ".claude/skills": "y"})
+
+        result = sync_repo(self.repo)
+
+        self.assertIsNone(result.error)
+        self.assertTrue((self.repo / "src" / "main.py").is_file())
+        self.assertTrue((mine / "SKILL.md").is_file())
+
+    def test_junk_state_entries_are_dropped_after_sync(self) -> None:
+        self._write_state({"../outside": "x"})
+        sync_repo(self.repo)
+        self.assertNotIn("../outside", load_state(self.repo).files)
+        self.assertEqual(sync_repo(self.repo).warnings, [])
+
+    def test_stale_managed_file_is_still_pruned(self) -> None:
+        stale = self.repo / ".claude" / "rules" / "old.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("old", encoding="utf-8")
+        self._write_state({".claude/rules/old.md": "x"})
+
+        sync_repo(self.repo)
+
+        self.assertFalse(stale.exists())
+
+    def test_symlink_at_destination_is_replaced_not_written_through(self) -> None:
+        victim = self.outside / "rcfile"
+        victim.write_text("original", encoding="utf-8")
+        dest = self.repo / ".claude" / "rules" / "general.md"
+        dest.parent.mkdir(parents=True)
+        dest.symlink_to(victim)
+
+        result = sync_repo(self.repo)
+
+        self.assertIsNone(result.error)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "original")
+        self.assertFalse(dest.is_symlink())
+        self.assertIn("General rule", dest.read_text(encoding="utf-8"))
+
+    def test_symlinked_parent_leaving_repo_fails_before_writing(self) -> None:
+        (self.repo / ".claude").symlink_to(self.outside)
+
+        result = sync_repo(self.repo)
+
+        self.assertIn("resolves outside the repo", result.error or "")
+        self.assertEqual(sorted(p.name for p in self.outside.iterdir()), ["keep.txt"])
+
+    def test_block_target_symlink_inside_repo_is_written_through(self) -> None:
+        save_config(
+            self.repo,
+            RepoConfig(agents=["claude"], rules=["general"], nested_rules=False),
+        )
+        (self.repo / "AGENTS.md").write_text("# mine\n", encoding="utf-8")
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+
+        result = sync_repo(self.repo)
+
+        self.assertIsNone(result.error)
+        self.assertTrue((self.repo / "CLAUDE.md").is_symlink())
+        text = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("# mine", text)
+        self.assertIn("General rule", text)
+
+    def test_block_target_symlink_leaving_repo_is_refused(self) -> None:
+        save_config(
+            self.repo,
+            RepoConfig(agents=["claude"], rules=["general"], nested_rules=False),
+        )
+        victim = self.outside / "rcfile"
+        victim.write_text("original", encoding="utf-8")
+        (self.repo / "CLAUDE.md").symlink_to(victim)
+
+        result = sync_repo(self.repo)
+
+        self.assertIn("leaves the repo", result.error or "")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "original")
+
+    def test_state_block_entry_outside_known_targets_is_ignored(self) -> None:
+        victim = self.outside / "rcfile"
+        victim.write_text("a\n<!-- myai:begin -->\nx\n<!-- myai:end -->\n", encoding="utf-8")
+        before = victim.read_text(encoding="utf-8")
+        self._write_state({}, {"../outside/rcfile": True})
+
+        result = sync_repo(self.repo)
+
+        self.assertIsNone(result.error)
+        self.assertEqual(victim.read_text(encoding="utf-8"), before)
+
+    def test_compute_sync_raises_unsafe_path_for_escaping_target(self) -> None:
+        (self.repo / ".claude").symlink_to(self.outside)
+        with self.assertRaises(UnsafePathError):
+            compute_sync(self.repo, load_config(self.repo), RepoState())
 
 
 if __name__ == "__main__":
