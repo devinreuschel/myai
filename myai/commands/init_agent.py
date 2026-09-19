@@ -9,7 +9,7 @@ from myai.agentsync.config import (
     normalize_agents,
     save_config,
 )
-from myai.agentsync.master import normalize_name_list
+from myai.agentsync.master import MasterError, normalize_name_list, resolve_selection
 from myai.agentsync.registry import add_repo, get_master
 
 
@@ -88,9 +88,27 @@ def run(args: argparse.Namespace) -> int:
     if master is None:
         print("error: no master repo registered; run myai master init first", file=sys.stderr)
         return 1
+    if not master.is_dir():
+        print(f"error: master repo not found at {master}", file=sys.stderr)
+        return 1
 
     if config_path(repo).is_file():
         print(f"error: already initialized at {config_path(repo)}", file=sys.stderr)
+        return 1
+
+    try:
+        agents = normalize_agents(args.agents)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    rules = normalize_name_list(args.rules or [])
+    skills = normalize_name_list(args.skills or [])
+    subagents = normalize_name_list(args.subagents or [])
+    try:
+        resolve_selection(master, rules, skills, subagents)
+    except MasterError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if not args.yes:
@@ -103,17 +121,11 @@ def run(args: argparse.Namespace) -> int:
             print("aborted")
             return 1
 
-    try:
-        agents = normalize_agents(args.agents)
-    except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
     cfg = RepoConfig(
         agents=agents,
-        rules=normalize_name_list(args.rules or []),
-        skills=normalize_name_list(args.skills or []),
-        subagents=normalize_name_list(args.subagents or []),
+        rules=rules,
+        skills=skills,
+        subagents=subagents,
         nested_rules=not args.flat_rules,
         inject_myai_rule=False if args.no_myai_rule else None,
     )

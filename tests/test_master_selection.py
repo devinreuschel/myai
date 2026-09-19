@@ -5,7 +5,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from myai.agentsync.config import ConfigError, AGENTS, load_config, normalize_agents
+from myai.agentsync.config import (
+    AGENTS,
+    ConfigError,
+    config_path,
+    load_config,
+    normalize_agents,
+)
 from myai.agentsync.global_config import load_global_sync_config
 from myai.agentsync.master import (
     MasterError,
@@ -15,7 +21,7 @@ from myai.agentsync.master import (
     normalize_name_list,
     resolve_selection,
 )
-from myai.agentsync.registry import set_master
+from myai.agentsync.registry import list_repos, set_master
 from myai.cli import main
 
 
@@ -230,6 +236,38 @@ class TestCliSelectionFlags(unittest.TestCase):
         self.assertEqual(cfg.skills, ["demo", "other"])
         data = json.loads((self.myai_dir / "global.json").read_text(encoding="utf-8"))
         self.assertEqual(data["rules"], ["all"])
+
+    def test_init_rejects_unknown_rule(self) -> None:
+        code = main([
+            "init",
+            "--path", str(self.repo),
+            "--rule", "langs/javascrip",
+            "-y",
+        ])
+        self.assertEqual(code, 1)
+        self.assertFalse(config_path(self.repo).is_file())
+        self.assertNotIn(self.repo.resolve(), list_repos())
+
+    def test_init_rejects_unknown_skill(self) -> None:
+        code = main([
+            "init",
+            "--path", str(self.repo),
+            "--skill", "nope",
+            "-y",
+        ])
+        self.assertEqual(code, 1)
+        self.assertFalse(config_path(self.repo).is_file())
+        self.assertNotIn(self.repo.resolve(), list_repos())
+
+    def test_global_init_rejects_unknown_rule(self) -> None:
+        global_path = self.myai_dir / "global.json"
+        code = main([
+            "global", "init",
+            "--rule", "langs/javascrip",
+            "-y",
+        ])
+        self.assertEqual(code, 1)
+        self.assertFalse(global_path.is_file())
 
 
 if __name__ == "__main__":
