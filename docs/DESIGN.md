@@ -125,15 +125,40 @@ Node sidecar imports `@earendil-works/gondolin`, calls `VM.create()` with
 programmable VFS mounts, and runs `vm.shell({ attach: true })` for the
 interactive pi session.
 
-The workspace mount uses `ShadowProvider` + `createShadowPathPredicate` to hide
-and deny guest access to configured paths (default: `/.myai`). Host-side sandbox
-config (`.myai/sandbox.json`) is read only on the host before boot; the guest
-never needs the repo-level `.myai/` directory.
+The workspace mount uses `ShadowProvider` with our own predicate
+(`sidecar/guard.mjs`) rather than Gondolin's `createShadowPathPredicate`. It hides
+`/.myai` plus any configured paths, and makes every `.git` readable but not
+writable, since hooks and config there run on the host. The stock predicate fell
+short twice on macOS: it compares names case-sensitively while APFS does not, and
+its symlink check realpaths the target, which fails for a file that does not
+exist yet. The guard folds case and re-checks writes against the nearest existing
+ancestor. It is still a path check made before the operation, so a guest racing
+a directory-for-symlink swap is a theoretical gap; Gondolin would need
+`openat2`-style resolution to close it.
+
+Host-side sandbox config (`.myai/sandbox.json`) is read only on the host before
+boot, and only once approved (`myai sandbox trust` pins the file's hash): the
+file arrives with the clone yet decides what the guest may reach. The keys that
+choose host-side or shared code (`gondolin_package`, `gondolin_version`,
+`pi_package`) are honored from the global config only.
+
+Git commits (`git_access: commit`) keep the same boundary. The base image has no
+git, so provisioning stages one into the persistent cache (binary in `pi-bin`,
+helpers and musl libs in `git-bundle/`). The real `.git` stays read-only; the
+agent commits into a scratch clone (`sandbox/agent-git/<hash>.git`) that borrows
+the repo's objects via a read-only `alternates` pointer and is mounted writable
+at `/root/agent-git` (`GIT_DIR`), with the workspace as `GIT_WORK_TREE`. Nothing
+the guest writes there is trusted: its hooks only run inside the VM, and before
+the host reads it after the run the `alternates` pointer is reset to a known-good
+path and the branches are fetched with `fsckObjects` into `refs/sandbox/<run>/*`.
+The user reviews and merges those like a pull request; their own branches are
+never written from inside the sandbox.
 
 Each `sandbox run` cold-boots a fresh VM that exits when pi exits. Pi session
-history still persists via the host-backed `~/.pi/agent/sessions` mount
-(`share_host_sessions`, default true), so `pi --resume <id>` works on the host or
-via `myai sandbox run -- --resume <id>`.
+history still persists via a host-backed mount of this repo's slot under
+`~/.pi/agent/sessions` (`share_host_sessions`, default true), so `pi --resume <id>`
+works on the host or via `myai sandbox run -- --resume <id>`. Only that slot is
+mounted; the tree holds every project's transcripts.
 
 ### Phase 3 (if the Node dependency itself is the problem): Python-native swap
 
