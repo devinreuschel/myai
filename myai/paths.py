@@ -30,6 +30,21 @@ def sandbox_locks_dir() -> Path:
     return sandbox_root() / "locks"
 
 
+def sandbox_agent_git_dir(repo_digest: str) -> Path:
+    """Per-repo scratch git dir the guest commits into (git_access='commit').
+
+    Kept out of the workspace and out of the real .git, mounted writable into the
+    guest; the host imports its refs after the run.
+    """
+    return sandbox_root() / "agent-git" / f"{repo_digest}.git"
+
+
+def sandbox_trust_path() -> Path:
+    """Approved repo sandbox configs. Kept out of sandbox/, whose subdirs get
+    mounted into guests."""
+    return state_root() / "sandbox-trust.json"
+
+
 def global_sandbox_config_path() -> Path | None:
     """Return the first existing global sandbox config path, or preferred write path."""
     candidates = [
