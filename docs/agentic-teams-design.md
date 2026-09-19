@@ -697,7 +697,9 @@ CREATE TABLE message_recipients (                     -- addressing = waking
 CREATE TABLE tasks (
   id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, title TEXT NOT NULL,
   owner_id TEXT, status TEXT NOT NULL,                -- open|active|blocked|needs_input|done|dropped
-  handoff TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  handoff TEXT, created_by TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,                 -- guards $EDITOR round-trips
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 
 CREATE TABLE mailbox (                                -- one bot, one wake at a time

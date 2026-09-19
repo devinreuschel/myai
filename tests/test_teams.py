@@ -1,52 +1,58 @@
 import argparse
 import io
 import os
+import shlex
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-import yaml
-
 from myai.commands import teams as teams_cmd
 from myai.paths import (
+    teams_artifacts_dir,
+    teams_bot_home,
+    teams_bots_dir,
     teams_daemon_lock_path,
     teams_db_path,
-    teams_prompts_dir,
     teams_root,
-    teams_transcripts_dir,
-    teams_worktrees_dir,
 )
 from myai.teams import db as db_mod
 from myai.teams.config import (
     ConfigError,
-    apply_concurrency_defaults,
-    default_config,
-    install_default_prompts,
-    resolve_prompt_path,
-    validate_config,
+    bot_config_from_yaml,
+    default_bot_config,
+    ensure_bot_home,
+    load_bot_config,
+    validate_bot_config,
 )
 from myai.teams.db import connect, ensure_state_dirs, migrate, open_db
 from myai.teams.editor import EditorError, EditRejected, edit_text
-from myai.teams.ids import IdError, format_epic_id, parse_epic_id, parse_task_id
+from myai.teams.ids import (
+    IdError,
+    format_task_id,
+    parse_principal_id,
+    parse_task_id,
+    slugify,
+)
 from myai.teams.store import (
+    MAILBOX_PRIORITY,
     StoreError,
-    abandon_epic,
-    approve_epic,
-    create_epic,
-    create_project,
+    create_bot,
     create_task,
-    get_project,
+    create_user,
+    get_dm,
+    get_principal,
     get_task,
-    list_projects,
     parse_task_edit_document,
-    project_config,
+    pending_mailbox,
+    post_message,
     status_overview,
     task_edit_document,
+    task_messages,
     update_task_from_edit,
 )
 
@@ -62,6 +68,11 @@ class TeamsTestCase(unittest.TestCase):
         self._env.stop()
         self._tmp.cleanup()
 
+    def _seed(self, conn: sqlite3.Connection, *bots: str) -> None:
+        create_user(conn, user_id="sam", name="Sam")
+        for bot_id in bots:
+            create_bot(conn, bot_id=bot_id, name=bot_id.title())
+
 
 class TestPathsAndMigrate(TeamsTestCase):
     def test_open_db_creates_layout_and_schema(self) -> None:
@@ -69,12 +80,9 @@ class TestPathsAndMigrate(TeamsTestCase):
         try:
             self.assertEqual(teams_db_path(), teams_root() / "teams.db")
             self.assertTrue(teams_db_path().is_file())
-            self.assertTrue(str(teams_db_path()).startswith(str(teams_root())))
-            self.assertTrue(teams_transcripts_dir().is_dir())
-            self.assertTrue(teams_worktrees_dir().is_dir())
+            self.assertTrue(teams_bots_dir().is_dir())
+            self.assertTrue(teams_artifacts_dir().is_dir())
             self.assertTrue(teams_daemon_lock_path().is_file())
-            self.assertTrue(teams_prompts_dir().is_dir())
-            self.assertEqual(teams_prompts_dir(), teams_root() / "prompts")
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -82,13 +90,17 @@ class TestPathsAndMigrate(TeamsTestCase):
                 )
             }
             for name in (
-                "projects",
-                "epics",
-                "tasks",
-                "runs",
-                "events",
-                "approvals",
+                "principals",
+                "contacts",
+                "conversations",
+                "participants",
                 "messages",
+                "message_recipients",
+                "tasks",
+                "mailbox",
+                "sessions",
+                "turns",
+                "events",
                 "schema_migrations",
             ):
                 self.assertIn(name, tables)
@@ -98,471 +110,479 @@ class TestPathsAndMigrate(TeamsTestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual(versions, [1, 2])
-            indexes = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index'"
-                )
-            }
-            self.assertIn("projects_name", indexes)
+            self.assertEqual(versions, [1])
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
             self.assertEqual(mode.lower(), "wal")
         finally:
             conn.close()
 
-    def test_open_approval_unique_indexes(self) -> None:
+    def test_pre_pivot_db_is_moved_aside_not_migrated(self) -> None:
+        ensure_state_dirs()
+        old = sqlite3.connect(str(teams_db_path()))
+        old.executescript(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);"
+            "INSERT INTO schema_migrations VALUES (1), (2);"
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT);"
+            "INSERT INTO projects(name) VALUES ('demo');"
+        )
+        old.close()
+
         conn = open_db()
         try:
-            proj = create_project(
-                conn, name="p", workspace_path=str(self.home / "ws")
+            self._seed(conn)
+        finally:
+            conn.close()
+
+        kept = list(teams_root().glob("teams.db.pre-pivot-*"))
+        self.assertEqual(len(kept), 1)
+        survivor = sqlite3.connect(str(kept[0]))
+        try:
+            self.assertEqual(
+                survivor.execute("SELECT name FROM projects").fetchone()[0], "demo"
             )
-            epic = create_epic(
-                conn,
-                project_id=proj["id"],
-                title="e",
-                goal="g",
-            )
-            task = create_task(
-                conn,
-                project_id=proj["id"],
-                title="t",
-                body="",
+        finally:
+            survivor.close()
+
+        # a current DB is left alone on the next open
+        open_db().close()
+        self.assertEqual(len(list(teams_root().glob("teams.db.pre-pivot-*"))), 1)
+
+    def test_turns_and_events_cannot_be_rewritten(self) -> None:
+        conn = open_db()
+        try:
+            self._seed(conn, "dev")
+            conn.execute(
+                "INSERT INTO sessions(bot_id, route, daemon_epoch, started_at) "
+                "VALUES ('dev', 'brain', 'e1', 't0')"
             )
             conn.execute(
-                """
-                INSERT INTO approvals(
-                  task_id, epic_id, project_id, kind, summary, requested_at
-                ) VALUES (?, NULL, ?, 'stage_gate', 'a', 't0')
-                """,
-                (task["id"], proj["id"]),
+                "INSERT INTO turns(session_id, seq, role, content_json, origin, event_time) "
+                "VALUES (1, 1, 'user', '{}', 'first_hand', 't0')"
             )
             conn.commit()
+            for statement in (
+                "UPDATE turns SET origin = 'recalled'",
+                "DELETE FROM turns",
+                "UPDATE events SET kind = 'x'",
+                "DELETE FROM events",
+            ):
+                with self.assertRaises(sqlite3.IntegrityError, msg=statement):
+                    conn.execute(statement)
+                conn.rollback()
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
-                    """
-                    INSERT INTO approvals(
-                      task_id, epic_id, project_id, kind, summary, requested_at
-                    ) VALUES (?, NULL, ?, 'stage_gate', 'b', 't1')
-                    """,
-                    (task["id"], proj["id"]),
+                    "INSERT INTO turns(session_id, seq, role, content_json, origin, "
+                    "event_time) VALUES (1, 2, 'user', '{}', 'guessed', 't0')"
                 )
-                conn.commit()
-            conn.rollback()
-            conn.execute(
-                """
-                INSERT INTO approvals(
-                  task_id, epic_id, project_id, kind, summary, requested_at
-                ) VALUES (NULL, ?, ?, 'epic_approval', 'a', 't0')
-                """,
-                (epic["id"], proj["id"]),
-            )
-            conn.commit()
-            with self.assertRaises(sqlite3.IntegrityError):
-                conn.execute(
-                    """
-                    INSERT INTO approvals(
-                      task_id, epic_id, project_id, kind, summary, requested_at
-                    ) VALUES (NULL, ?, ?, 'epic_approval', 'b', 't1')
-                    """,
-                    (epic["id"], proj["id"]),
-                )
-                conn.commit()
         finally:
             conn.close()
 
 
-class TestConfig(TeamsTestCase):
-    def test_concurrency_defaults(self) -> None:
-        cfg = {
-            "roster": {
-                "developer": {
-                    "backend": "cursor",
-                    "prompt": "/tmp/dev.md",
-                }
-            },
-            "pipeline": [
-                {"stage": "develop", "role": "developer", "gate": "auto"}
-            ],
-        }
-        out = apply_concurrency_defaults(cfg)
-        self.assertEqual(out["concurrency"]["per_stage"]["develop"], 1)
-        self.assertEqual(out["concurrency"]["pm"], 1)
-        self.assertNotIn("max_total", out["concurrency"])
+class TestBotConfig(TeamsTestCase):
+    def test_defaults_fill_in(self) -> None:
+        cfg = validate_bot_config({"name": " Dev Lead ", "budgets": {"wake_turns": 3}})
+        self.assertEqual(cfg["name"], "Dev Lead")
+        self.assertEqual(cfg["preset"], "hands-off")
+        self.assertEqual(cfg["budgets"], {"wake_turns": 3, "wake_seconds": 60})
 
-    def test_default_config_roster_uses_relative_prompts(self) -> None:
-        install_default_prompts()
-        cfg = default_config()
-        for role, filename in (
-            ("pm", "pm.md"),
-            ("designer", "designer.md"),
-            ("developer", "developer.md"),
-            ("qa", "qa.md"),
+    def test_rejects_bad_configs(self) -> None:
+        base = default_bot_config("Dev")
+        for bad in (
+            [],
+            {**base, "name": ""},
+            {**base, "preset": "yolo"},
+            {**base, "budget": {}},
+            {**base, "budgets": {"wake_turns": 0}},
+            {**base, "budgets": {"wake_turns": True}},
+            {**base, "budgets": {"wake_minutes": 5}},
+            {**base, "job": 7},
         ):
-            rel = cfg["roster"][role]["prompt"]
-            self.assertEqual(rel, f"prompts/{filename}")
-            resolved = resolve_prompt_path(rel)
-            self.assertEqual(resolved, teams_prompts_dir() / filename)
-            self.assertTrue(resolved.is_file())
-        groom = resolve_prompt_path(cfg["roster"]["pm"]["groom_prompt"])
-        self.assertTrue(groom.is_file())
-
-    def test_resolve_prompt_path_project_local(self) -> None:
-        ws = self.home / "ws"
-        dest = ws / ".myai" / "teams" / "prompts"
-        dest.mkdir(parents=True)
-        custom = dest / "developer.md"
-        custom.write_text("custom", encoding="utf-8")
-        resolved = resolve_prompt_path(
-            ".myai/teams/prompts/developer.md", workspace_path=ws
-        )
-        self.assertEqual(resolved, custom.resolve())
-
-    def test_validate_config_pipeline_rules(self) -> None:
-        base = {
-            "roster": {
-                "developer": {"backend": "cursor", "prompt": "prompts/dev.md"},
-            },
-            "pipeline": [
-                {"stage": "develop", "role": "developer", "gate": "auto"},
-            ],
-        }
-        validate_config(base)
-
-        bad_role = {
-            **base,
-            "pipeline": [{"stage": "develop", "role": "nope", "gate": "auto"}],
-        }
+            with self.assertRaises(ConfigError, msg=repr(bad)):
+                validate_bot_config(bad)
         with self.assertRaises(ConfigError):
-            validate_config(bad_role)
+            bot_config_from_yaml("name: [unclosed")
 
-        dup = {
-            **base,
-            "pipeline": [
-                {"stage": "develop", "role": "developer"},
-                {"stage": "develop", "role": "developer"},
-            ],
-        }
-        with self.assertRaises(ConfigError):
-            validate_config(dup)
+    def test_bot_home_is_seeded_once(self) -> None:
+        home = ensure_bot_home("dev", default_bot_config("Dev", "ships slices"))
+        self.assertEqual(home, teams_bot_home("dev"))
+        for sub in ("playbooks", "workspace"):
+            self.assertTrue((home / sub).is_dir())
+        self.assertIn("ships slices", (home / "persona.md").read_text())
+        self.assertEqual(load_bot_config("dev")["job"], "ships slices")
 
-        bad_fail = {
-            **base,
-            "pipeline": [
-                {
-                    "stage": "qa",
-                    "role": "developer",
-                    "on_fail": "missing",
-                }
-            ],
-        }
-        with self.assertRaises(ConfigError):
-            validate_config(bad_fail)
-
-        bad_per = {
-            **base,
-            "concurrency": {"per_stage": {"develop": "2"}},
-        }
-        with self.assertRaises(ConfigError):
-            validate_config(bad_per)
+        (home / "persona.md").write_text("mine", encoding="utf-8")
+        ensure_bot_home("dev", default_bot_config("Other"))
+        self.assertEqual((home / "persona.md").read_text(), "mine")
+        self.assertEqual(load_bot_config("dev")["name"], "Dev")
 
 
-class TestStoreAndCli(TeamsTestCase):
-    def _capture(self, fn, *args, **kwargs) -> tuple[int, str]:
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            code = fn(*args, **kwargs)
-        return code, buf.getvalue()
-
-    def test_init_and_project_list(self) -> None:
-        ws = self.home / "repo"
-        ws.mkdir()
-        ns = argparse.Namespace(name="demo", path=str(ws))
-        code, out = self._capture(teams_cmd.run_init, ns)
-        self.assertEqual(code, 0)
-        self.assertIn("demo", out)
-        code, out = self._capture(
-            teams_cmd.run_project_list, argparse.Namespace()
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("demo", out)
-        self.assertIn(str(ws.resolve()), out)
+class TestStore(TeamsTestCase):
+    def test_single_user(self) -> None:
         conn = open_db()
         try:
-            rows = list_projects(conn)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["name"], "demo")
-        finally:
-            conn.close()
-        self.assertEqual(teams_cmd.run_init(ns), 1)
-
-    def test_duplicate_project_name(self) -> None:
-        conn = open_db()
-        try:
-            install_default_prompts()
-            create_project(conn, name="demo", workspace_path=str(self.home))
+            self._seed(conn)
             with self.assertRaises(StoreError) as ctx:
-                create_project(
-                    conn, name="demo", workspace_path=str(self.home / "other")
-                )
-            self.assertIn("already exists", str(ctx.exception))
+                create_user(conn, user_id="alex", name="Alex")
+            self.assertIn("already initialized", str(ctx.exception))
         finally:
             conn.close()
 
-    def test_project_edit_round_trip(self) -> None:
+    def test_bot_needs_a_user(self) -> None:
         conn = open_db()
         try:
-            install_default_prompts()
-            proj = create_project(
-                conn, name="demo", workspace_path=str(self.home)
-            )
-            cfg = default_config()
-            cfg["concurrency"]["per_stage"]["develop"] = 7
-            yaml_text = yaml.safe_dump(cfg, sort_keys=False)
-
-            def fake_edit(initial, *, suffix=".yaml", parse=lambda t: t):
-                return parse(yaml_text)
-
-            with patch("myai.commands.teams.edit_text", side_effect=fake_edit):
-                code = teams_cmd.run_project_edit(
-                    argparse.Namespace(name="demo")
-                )
-            self.assertEqual(code, 0)
-            got = project_config(get_project(conn, project_id=proj["id"]))
-            self.assertEqual(got["concurrency"]["per_stage"]["develop"], 7)
+            with self.assertRaises(StoreError) as ctx:
+                create_bot(conn, bot_id="dev", name="Dev")
+            self.assertIn("teams init", str(ctx.exception))
         finally:
             conn.close()
 
-    def test_task_standalone_and_epic_linked(self) -> None:
+    def test_create_bot_opens_dm_and_contact(self) -> None:
         conn = open_db()
         try:
-            install_default_prompts()
-            proj = create_project(
-                conn, name="demo", workspace_path=str(self.home)
-            )
-            standalone = create_task(
-                conn,
-                project_id=proj["id"],
-                title="chore",
-                body="do it",
-            )
-            self.assertIsNone(standalone["epic_id"])
-            self.assertEqual(standalone["status"], "backlog")
+            self._seed(conn, "dev")
+            dm = get_dm(conn, "sam", "dev")
+            self.assertEqual(dm["kind"], "dm")
+            contacts = conn.execute(
+                "SELECT contact_id FROM contacts WHERE bot_id = 'dev'"
+            ).fetchall()
+            self.assertEqual([r[0] for r in contacts], ["sam"])
 
-            epic = create_epic(
-                conn,
-                project_id=proj["id"],
-                title="feat",
-                goal="ship it",
-                status="awaiting_approval",
-            )
-            draft = create_task(
-                conn,
-                project_id=proj["id"],
-                title="impl",
-                body="code",
-                epic_id=epic["id"],
-                status="draft",
-            )
-            self.assertEqual(draft["status"], "draft")
+            # ids are one space: a bot cannot take the user's id, or another bot's
+            for taken in ("sam", "dev"):
+                with self.assertRaises(StoreError) as ctx:
+                    create_bot(conn, bot_id=taken, name="x")
+                self.assertIn("already taken", str(ctx.exception))
+            self.assertEqual(get_principal(conn, "sam")["kind"], "user")
+            self.assertFalse(conn.in_transaction)
+        finally:
+            conn.close()
 
-            self.assertEqual(draft["version"], 1)
-            approve_epic(conn, epic["id"])
-            draft2 = get_task(conn, draft["id"])
-            self.assertEqual(draft2["status"], "backlog")
-            self.assertEqual(draft2["version"], 1)
-            epic2 = conn.execute(
-                "SELECT * FROM epics WHERE id = ?", (epic["id"],)
-            ).fetchone()
-            self.assertEqual(epic2["status"], "executing")
-            self.assertEqual(epic2["branch"], f"teams/E-{epic['id']}")
+    def test_addressing_wakes_only_bots_addressed(self) -> None:
+        conn = open_db()
+        try:
+            self._seed(conn, "dev")
+            dm = get_dm(conn, "sam", "dev")["id"]
+            post_message(
+                conn, conversation_id=dm, sender_id="sam", body="fyi", recipients=[]
+            )
+            self.assertEqual(pending_mailbox(conn, "dev"), [])
 
+            msg = post_message(
+                conn, conversation_id=dm, sender_id="sam", body="go", recipients=["dev"]
+            )
+            (item,) = pending_mailbox(conn, "dev")
+            self.assertEqual(item["kind"], "user_message")
+            self.assertEqual(item["ref_id"], msg["id"])
+            self.assertEqual(item["priority"], MAILBOX_PRIORITY["user_message"])
+
+            # a reply addressed to the human enqueues nothing: only bots have mailboxes
+            post_message(
+                conn, conversation_id=dm, sender_id="dev", body="ok", recipients=["sam"]
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM mailbox").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+
+    def test_mailbox_orders_user_before_bots(self) -> None:
+        conn = open_db()
+        try:
+            self._seed(conn, "dev", "qa")
+            now = "2026-01-01T00:00:00+00:00"
             conn.execute(
-                "UPDATE epics SET status = 'awaiting_review' WHERE id = ?",
-                (epic["id"],),
+                "INSERT INTO conversations(kind, created_at) VALUES ('group', ?)", (now,)
+            )
+            group = conn.execute("SELECT MAX(id) FROM conversations").fetchone()[0]
+            conn.executemany(
+                "INSERT INTO participants VALUES (?, ?, ?)",
+                [(group, p, now) for p in ("sam", "dev", "qa")],
+            )
+            conn.execute("INSERT INTO contacts VALUES ('qa', 'dev')")
+            conn.commit()
+
+            post_message(
+                conn, conversation_id=group, sender_id="qa", body="pr open",
+                recipients=["dev"],
+            )
+            post_message(
+                conn, conversation_id=group, sender_id="sam", body="status?",
+                recipients=["dev"],
+            )
+            kinds = [row["kind"] for row in pending_mailbox(conn, "dev")]
+            self.assertEqual(kinds, ["user_message", "bot_message"])
+            # membership is visibility, not waking
+            self.assertEqual(pending_mailbox(conn, "qa"), [])
+        finally:
+            conn.close()
+
+    def test_address_book_is_enforced(self) -> None:
+        conn = open_db()
+        try:
+            self._seed(conn, "dev", "qa")
+            now = "2026-01-01T00:00:00+00:00"
+            conn.execute(
+                "INSERT INTO conversations(kind, created_at) VALUES ('group', ?)", (now,)
+            )
+            group = conn.execute("SELECT MAX(id) FROM conversations").fetchone()[0]
+            conn.executemany(
+                "INSERT INTO participants VALUES (?, ?, ?)",
+                [(group, p, now) for p in ("sam", "dev", "qa")],
             )
             conn.commit()
-            approve_epic(conn, epic["id"])
-            epic3 = conn.execute(
-                "SELECT status FROM epics WHERE id = ?", (epic["id"],)
-            ).fetchone()
-            self.assertEqual(epic3["status"], "done")
-        finally:
-            conn.close()
 
-    def test_create_task_rejects_cross_project_epic(self) -> None:
-        conn = open_db()
-        try:
-            install_default_prompts()
-            a = create_project(
-                conn, name="a", workspace_path=str(self.home / "a")
-            )
-            b = create_project(
-                conn, name="b", workspace_path=str(self.home / "b")
-            )
-            epic = create_epic(
-                conn, project_id=a["id"], title="e", goal="g"
-            )
             with self.assertRaises(StoreError) as ctx:
-                create_task(
-                    conn,
-                    project_id=b["id"],
-                    title="t",
-                    epic_id=epic["id"],
+                post_message(
+                    conn, conversation_id=group, sender_id="dev", body="hi",
+                    recipients=["qa"],
                 )
-            self.assertIn("different project", str(ctx.exception))
+            self.assertIn("no contact entry", str(ctx.exception))
+
+            dm = get_dm(conn, "sam", "dev")["id"]
+            for kwargs, needle in (
+                ({"sender_id": "qa", "recipients": []}, "is not in conversation"),
+                ({"sender_id": "sam", "recipients": ["qa"]}, "recipients not in"),
+                ({"sender_id": "sam", "recipients": ["sam"]}, "its sender"),
+            ):
+                with self.assertRaises(StoreError) as ctx:
+                    post_message(conn, conversation_id=dm, body="x", **kwargs)
+                self.assertIn(needle, str(ctx.exception))
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0
+            )
+            self.assertFalse(conn.in_transaction)
         finally:
             conn.close()
 
-    def test_cli_task_add_show_list(self) -> None:
-        ws = self.home / "repo"
-        ws.mkdir()
-        self.assertEqual(
-            teams_cmd.run_init(
-                argparse.Namespace(name="demo", path=str(ws))
-            ),
-            0,
-        )
-        code, out = self._capture(
-            teams_cmd.run_task_add,
-            argparse.Namespace(
-                title="chore",
-                body="do it",
-                epic=None,
-                status=None,
-                priority=0,
-                stage=None,
-                role=None,
-                project="demo",
-            ),
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("T-1", out)
-        self.assertIn("chore", out)
-        self.assertIn("standalone", out)
-
-        code, out = self._capture(
-            teams_cmd.run_task_list,
-            argparse.Namespace(project="demo", epic=None),
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("T-1", out)
-        self.assertIn("chore", out)
-
-        code, out = self._capture(
-            teams_cmd.run_task_show,
-            argparse.Namespace(task_id="T-1"),
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("id:         T-1", out)
-        self.assertIn("title:      chore", out)
-        self.assertIn("do it", out)
-
-    def test_epic_abandon(self) -> None:
+    def test_task_is_a_thread_with_an_owner(self) -> None:
         conn = open_db()
         try:
-            install_default_prompts()
-            proj = create_project(
-                conn, name="demo", workspace_path=str(self.home)
-            )
-            epic = create_epic(
-                conn, project_id=proj["id"], title="x", goal="y"
-            )
-            abandon_epic(conn, epic["id"])
-            row = conn.execute(
-                "SELECT status FROM epics WHERE id = ?", (epic["id"],)
-            ).fetchone()
-            self.assertEqual(row["status"], "abandoned")
-        finally:
-            conn.close()
-
-    def test_task_edit_bumps_version(self) -> None:
-        conn = open_db()
-        try:
-            install_default_prompts()
-            proj = create_project(
-                conn, name="demo", workspace_path=str(self.home)
-            )
+            self._seed(conn, "dev")
+            dm = get_dm(conn, "sam", "dev")["id"]
             task = create_task(
-                conn,
-                project_id=proj["id"],
-                title="t",
-                body="old",
+                conn, conversation_id=dm, title="add oauth", created_by="sam",
+                owner_id="dev", body="token refresh first",
             )
-            doc = task_edit_document(task)
-            fields = parse_task_edit_document(doc)
-            fields["title"] = "t2"
-            fields["body"] = "new"
-            fields["priority"] = 5
+            self.assertEqual(task["status"], "open")
+            self.assertEqual(task["owner_id"], "dev")
+            (opening,) = task_messages(conn, task["id"])
+            self.assertEqual(opening["body"], "token refresh first")
+            (item,) = pending_mailbox(conn, "dev")
+            self.assertEqual(item["ref_id"], opening["id"])
+
+            untitled_body = create_task(
+                conn, conversation_id=dm, title="chore", created_by="sam", owner_id="dev"
+            )
+            self.assertEqual(task_messages(conn, untitled_body["id"])[0]["body"], "chore")
+
+            with self.assertRaises(StoreError):
+                create_task(
+                    conn, conversation_id=dm, title="x", created_by="sam",
+                    owner_id="nobody",
+                )
+            kinds = [
+                r[0] for r in conn.execute("SELECT kind FROM events ORDER BY id")
+            ]
+            self.assertEqual(kinds.count("task_created"), 2)
+            self.assertEqual(kinds.count("message_posted"), 2)
+        finally:
+            conn.close()
+
+    def test_task_edit_bumps_version_and_detects_concurrent_change(self) -> None:
+        conn = open_db()
+        try:
+            self._seed(conn, "dev")
+            dm = get_dm(conn, "sam", "dev")["id"]
+            task = create_task(
+                conn, conversation_id=dm, title="t", created_by="sam", owner_id="dev"
+            )
+            stale_doc = task_edit_document(task)
+
+            fields = parse_task_edit_document(stale_doc)
+            fields.update(title="t2", status="active", handoff="next: tests")
             updated = update_task_from_edit(conn, task["id"], **fields)
             self.assertEqual(updated["version"], 2)
             self.assertEqual(updated["title"], "t2")
-            self.assertEqual(updated["body"], "new")
-            self.assertEqual(updated["priority"], 5)
+            self.assertEqual(updated["status"], "active")
+            self.assertEqual(updated["handoff"], "next: tests")
+            self.assertEqual(
+                parse_task_edit_document(task_edit_document(updated))["handoff"],
+                "next: tests",
+            )
 
-            # Stub fields are read-only
-            fields2 = parse_task_edit_document(task_edit_document(updated))
-            fields2["version"] = 99
+            # an edit that began on version 1 must not clobber version 2
             with self.assertRaises(StoreError) as ctx:
-                update_task_from_edit(conn, task["id"], **fields2)
-            self.assertIn("read-only", str(ctx.exception))
+                update_task_from_edit(
+                    conn, task["id"], **parse_task_edit_document(stale_doc)
+                )
+            self.assertIn("changed while it was being edited", str(ctx.exception))
+
+            fields = parse_task_edit_document(task_edit_document(updated))
+            fields["owner_id"] = "stranger"
+            with self.assertRaises(StoreError):
+                update_task_from_edit(conn, task["id"], **fields)
         finally:
             conn.close()
 
     def test_status_counts(self) -> None:
         conn = open_db()
         try:
-            install_default_prompts()
-            proj = create_project(
-                conn, name="demo", workspace_path=str(self.home)
-            )
-            create_task(
-                conn,
-                project_id=proj["id"],
-                title="a",
-                status="running",
-                stage="develop",
-            )
-            create_task(
-                conn,
-                project_id=proj["id"],
-                title="b",
-                status="ready",
-                stage="design",
-            )
-            create_task(
-                conn,
-                project_id=proj["id"],
-                title="c",
-                status="ready",
-                stage="design",
-            )
-            overview = status_overview(conn, proj["id"])
-            self.assertEqual(overview["task_counts"]["running"], 1)
-            self.assertEqual(overview["task_counts"]["ready"], 2)
-            self.assertEqual(len(overview["in_flight"]), 1)
-            self.assertEqual(overview["queued_by_stage"]["design"], 2)
+            self._seed(conn, "dev")
+            dm = get_dm(conn, "sam", "dev")["id"]
+            for title in ("a", "b", "c"):
+                create_task(
+                    conn, conversation_id=dm, title=title, created_by="sam",
+                    owner_id="dev",
+                )
+            done = parse_task_edit_document(task_edit_document(get_task(conn, 1)))
+            done["status"] = "done"
+            update_task_from_edit(conn, 1, **done)
+
+            overview = status_overview(conn)
+            self.assertEqual(overview["task_counts"], {"done": 1, "open": 2})
+            (bot,) = overview["bots"]
+            self.assertEqual(bot["open_tasks"], 2)
+            self.assertEqual(bot["pending"], 3)
         finally:
             conn.close()
 
-    def test_cli_status_without_daemon(self) -> None:
-        ws = self.home / "repo"
-        ws.mkdir()
-        self.assertEqual(
-            teams_cmd.run_init(
-                argparse.Namespace(name="demo", path=str(ws))
-            ),
-            0,
-        )
-        code = teams_cmd.run_status(argparse.Namespace(project=None))
-        self.assertEqual(code, 0)
-
     def test_ids(self) -> None:
-        self.assertEqual(parse_epic_id("E-12"), 12)
         self.assertEqual(parse_task_id("t-3"), 3)
-        self.assertEqual(format_epic_id(12), "E-12")
+        self.assertEqual(format_task_id(12), "T-12")
+        self.assertEqual(slugify("Dev Lead!"), "dev-lead")
+        self.assertEqual(parse_principal_id(" qa-2 "), "qa-2")
+        for bad in ("12", "T12"):
+            with self.assertRaises(IdError):
+                parse_task_id(bad)
+        for bad in ("Dev", "-dev", "a/b", "", "x" * 33):
+            with self.assertRaises(IdError, msg=bad):
+                parse_principal_id(bad)
         with self.assertRaises(IdError):
-            parse_epic_id("12")
+            slugify("!!!")
+
+
+class TestCli(TeamsTestCase):
+    def _run(self, fn, **kwargs) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = fn(argparse.Namespace(**kwargs))
+        return code, out.getvalue(), err.getvalue()
+
+    def _init(self) -> None:
+        self.assertEqual(self._run(teams_cmd.run_init, user="Sam")[0], 0)
+        code, out, _ = self._run(
+            teams_cmd.run_bot_new, name="Dev Lead", id=None, job="ships slices"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("dev-lead", out)
+
+    def test_init_once(self) -> None:
+        code, out, _ = self._run(teams_cmd.run_init, user="Sam")
+        self.assertEqual(code, 0)
+        self.assertIn("sam", out)
+        code, _, err = self._run(teams_cmd.run_init, user="Sam")
+        self.assertEqual(code, 1)
+        self.assertIn("already initialized", err)
+
+    def test_bot_new_list_and_duplicate(self) -> None:
+        self._init()
+        self.assertTrue((teams_bot_home("dev-lead") / "bot.yaml").is_file())
+        code, out, _ = self._run(teams_cmd.run_bot_list)
+        self.assertEqual(code, 0)
+        self.assertIn("dev-lead\tDev Lead\tships slices", out)
+
+        code, _, err = self._run(
+            teams_cmd.run_bot_new, name="Dev Lead", id=None, job=""
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("already taken", err)
+        code, _, err = self._run(teams_cmd.run_bot_new, name="x", id="Bad Id", job="")
+        self.assertEqual(code, 1)
+
+    def test_bot_edit_keeps_the_users_yaml_and_syncs_the_name(self) -> None:
+        self._init()
+        edited = "# my notes\nname: Lead\njob: ships slices\npreset: supervised\n"
+
+        def fake_edit(initial, *, suffix=".yaml", parse=lambda t: t):
+            return parse(edited)
+
+        with patch("myai.commands.teams.edit_text", side_effect=fake_edit):
+            code, _, _ = self._run(teams_cmd.run_bot_edit, bot=None)
+        self.assertEqual(code, 0)
+        path = teams_bot_home("dev-lead") / "bot.yaml"
+        self.assertEqual(path.read_text(), edited)
+        self.assertEqual(load_bot_config("dev-lead")["preset"], "supervised")
+        conn = open_db()
+        try:
+            self.assertEqual(get_principal(conn, "dev-lead")["name"], "Lead")
+        finally:
+            conn.close()
+
+    def test_bot_edit_rejects_bad_config_and_leaves_file(self) -> None:
+        self._init()
+        path = teams_bot_home("dev-lead") / "bot.yaml"
+        before = path.read_text()
+
+        def bad_edit(initial, *, suffix=".yaml", parse=lambda t: t):
+            return parse("name: Lead\npreset: yolo\n")
+
+        with patch("myai.commands.teams.edit_text", side_effect=bad_edit):
+            code, _, err = self._run(teams_cmd.run_bot_edit, bot="dev-lead")
+        self.assertEqual(code, 1)
+        self.assertIn("preset", err)
+        self.assertEqual(path.read_text(), before)
+
+    def test_task_add_show_list(self) -> None:
+        self._init()
+        code, out, _ = self._run(
+            teams_cmd.run_task_add, title="chore", body="do it", bot=None
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("T-1\topen\tdev-lead\tchore", out)
+
+        code, out, _ = self._run(teams_cmd.run_task_list, bot=None, status=None)
+        self.assertEqual(code, 0)
+        self.assertIn("T-1", out)
+        code, out, _ = self._run(teams_cmd.run_task_list, bot="dev-lead", status="done")
+        self.assertIn("no tasks", out)
+
+        code, out, _ = self._run(teams_cmd.run_task_show, task_id="T-1")
+        self.assertEqual(code, 0)
+        self.assertIn("id:       T-1", out)
+        self.assertIn("owner:    dev-lead", out)
+        self.assertIn("sam: do it", out)
+
+        code, _, err = self._run(teams_cmd.run_task_show, task_id="T-9")
+        self.assertEqual(code, 1)
+        self.assertIn("not found", err)
+
+    def test_task_add_needs_a_bot(self) -> None:
+        self.assertEqual(self._run(teams_cmd.run_init, user="Sam")[0], 0)
+        code, _, err = self._run(teams_cmd.run_task_add, title="t", body="", bot=None)
+        self.assertEqual(code, 1)
+        self.assertIn("no bots", err)
+
+    def test_status(self) -> None:
+        code, _, err = self._run(teams_cmd.run_status)
+        self.assertEqual(code, 1)
+        self.assertIn("teams init", err)
+
+        self._init()
+        self._run(teams_cmd.run_task_add, title="chore", body="", bot=None)
+        code, out, _ = self._run(teams_cmd.run_status)
+        self.assertEqual(code, 0)
+        self.assertIn("user: sam", out)
+        self.assertIn("dev-lead\tqueued wakes: 1\topen tasks: 1", out)
+        self.assertIn("open: 1", out)
+
+    def test_pre_pivot_db_is_reported(self) -> None:
+        ensure_state_dirs()
+        old = sqlite3.connect(str(teams_db_path()))
+        old.executescript("CREATE TABLE projects (id INTEGER PRIMARY KEY);")
+        old.close()
+        code, _, err = self._run(teams_cmd.run_init, user="Sam")
+        self.assertEqual(code, 0)
+        self.assertIn("pre-pivot", err)
 
 
 class TestMigrationAtomicity(TeamsTestCase):
@@ -594,14 +614,14 @@ class TestMigrationAtomicity(TeamsTestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            self.assertIn("projects", tables)
+            self.assertIn("principals", tables)
             versions = [
                 row[0]
                 for row in conn.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual(versions, [1, 2])
+            self.assertEqual(versions, [1])
         finally:
             conn.close()
 
@@ -627,9 +647,11 @@ class TestMigrationAtomicity(TeamsTestCase):
 class TestEditor(TeamsTestCase):
     def _fake_editor(self, writes: str) -> Path:
         """An editor that writes `writes` to whichever arg is the file path."""
+        payload = self.home / "fake-editor-payload"
+        payload.write_text(writes, encoding="utf-8")
         script = self.home / "fake-editor"
         script.write_text(
-            f'#!/bin/sh\nfor f in "$@"; do :; done\nprintf {writes!r} > "$f"\n'
+            f'#!/bin/sh\nfor f in "$@"; do :; done\ncat {shlex.quote(str(payload))} > "$f"\n'
         )
         script.chmod(0o755)
         return script
@@ -681,35 +703,49 @@ class TestEditor(TeamsTestCase):
         self.assertEqual(len(made), 1)
         self.assertFalse(Path(made[0]).exists())
 
-    def test_bad_blocked_by_is_config_error(self) -> None:
-        with self.assertRaises(ConfigError):
-            parse_task_edit_document(
-                "---\ntitle: t\nblocked_by: [not-a-number]\n---\n\nbody"
-            )
+    def test_bad_task_frontmatter_is_config_error(self) -> None:
+        for doc in (
+            "no frontmatter",
+            "---\ntitle: t\n",
+            "---\n- a list\n---\n",
+            "---\nstatus: open\n---\n",
+            "---\ntitle: t\nstatus: running\n---\n",
+            "---\ntitle: t\nowner: 7\n---\n",
+        ):
+            with self.assertRaises(ConfigError, msg=doc):
+                parse_task_edit_document(doc)
 
-    def test_cli_task_edit_reports_rejected_edit(self) -> None:
+    def test_cli_task_edit_keeps_a_rejected_edit(self) -> None:
+        """The update runs inside parse, so a store rejection keeps the file too."""
         conn = open_db()
         try:
-            install_default_prompts()
-            proj = create_project(
-                conn, name="demo", workspace_path=str(self.home)
+            self._seed(conn, "dev")
+            task = create_task(
+                conn, conversation_id=get_dm(conn, "sam", "dev")["id"], title="t",
+                created_by="sam", owner_id="dev",
             )
-            task = create_task(conn, project_id=proj["id"], title="t", body="keep")
         finally:
             conn.close()
 
-        def bad_edit(initial, *, suffix=".md", parse=lambda t: t):
-            return parse("---\ntitle: t\nblocked_by: [nope]\n---\n\nnew spec")
-
-        with patch("myai.commands.teams.edit_text", side_effect=bad_edit):
-            code = teams_cmd.run_task_edit(
-                argparse.Namespace(task_id=f"T-{task['id']}")
-            )
+        script = self._fake_editor("---\ntitle: t\nowner: stranger\nversion: 1\n---\n")
+        err = io.StringIO()
+        with patch.dict(os.environ, {"EDITOR": str(script)}):
+            os.environ.pop("VISUAL", None)
+            with redirect_stderr(err):
+                code = teams_cmd.run_task_edit(
+                    argparse.Namespace(task_id=f"T-{task['id']}")
+                )
         self.assertEqual(code, 1)
+        self.assertIn("not in the task's conversation", err.getvalue())
+        self.assertIn("edit kept at", err.getvalue())
+        kept = Path(err.getvalue().split("edit kept at ")[1].strip())
+        self.assertTrue(kept.is_file())
+        kept.unlink()
+
         conn = open_db()
         try:
             unchanged = get_task(conn, task["id"])
-            self.assertEqual(unchanged["body"], "keep")
+            self.assertEqual(unchanged["owner_id"], "dev")
             self.assertEqual(unchanged["version"], 1)
         finally:
             conn.close()

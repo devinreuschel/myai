@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
 from myai.paths import (
+    teams_artifacts_dir,
+    teams_bots_dir,
     teams_daemon_lock_path,
     teams_db_path,
-    teams_prompts_dir,
-    teams_transcripts_dir,
-    teams_worktrees_dir,
 )
 
 BUSY_TIMEOUT_MS = 5000
@@ -17,7 +17,6 @@ BUSY_TIMEOUT_MS = 5000
 # (version, resource filename under myai.teams.migrations)
 _MIGRATIONS: list[tuple[int, str]] = [
     (1, "001_initial.sql"),
-    (2, "002_projects_name_unique.sql"),
 ]
 
 
@@ -27,11 +26,7 @@ class TeamsDBError(Exception):
 
 def ensure_state_dirs() -> None:
     """Create XDG teams dirs and a placeholder daemon.lock."""
-    for path in (
-        teams_transcripts_dir(),
-        teams_worktrees_dir(),
-        teams_prompts_dir(),
-    ):
+    for path in (teams_bots_dir(), teams_artifacts_dir()):
         path.mkdir(parents=True, exist_ok=True)
     lock = teams_daemon_lock_path()
     if not lock.exists():
@@ -83,9 +78,40 @@ def migrate(conn: sqlite3.Connection) -> None:
             raise
 
 
+def move_aside_pre_pivot(db_path: Path | None = None) -> Path | None:
+    """Rename a teams.db left by the pipeline design; return where it went.
+
+    That schema shares migration version numbers with this one, so it cannot be
+    migrated forward. Nothing shipped on it, so it is kept, not converted.
+    """
+    path = db_path if db_path is not None else teams_db_path()
+    if not path.is_file():
+        return None
+    conn = sqlite3.connect(str(path))
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'projects'"
+        ).fetchone()
+        if found is None:
+            return None
+        # fold the WAL back in so the renamed file is complete on its own
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = path.with_name(f"{path.name}.pre-pivot-{stamp}")
+    path.rename(dest)
+    for suffix in ("-wal", "-shm"):
+        side = path.with_name(path.name + suffix)
+        if side.exists():
+            side.rename(dest.with_name(dest.name + suffix))
+    return dest
+
+
 def open_db(db_path: Path | None = None) -> sqlite3.Connection:
     """Ensure dirs, connect, and migrate. Caller owns the connection."""
     ensure_state_dirs()
+    move_aside_pre_pivot(db_path)
     conn = connect(db_path)
     migrate(conn)
     return conn

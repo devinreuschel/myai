@@ -1,43 +1,45 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import sqlite3
 import sys
-from pathlib import Path
 
+from myai.paths import teams_bot_home
 from myai.teams.config import (
+    BOT_CONFIG_FILE,
+    TASK_STATUSES,
     ConfigError,
-    config_from_yaml,
-    config_to_yaml,
-    default_config,
-    install_default_prompts,
+    bot_config_from_yaml,
+    default_bot_config,
+    ensure_bot_home,
+    load_bot_config,
 )
-from myai.teams.db import open_db
+from myai.teams.db import move_aside_pre_pivot, open_db
 from myai.teams.editor import EditorError, edit_text
 from myai.teams.ids import (
     IdError,
-    format_epic_id,
     format_task_id,
-    parse_epic_id,
+    parse_principal_id,
     parse_task_id,
+    slugify,
 )
 from myai.teams.store import (
     StoreError,
-    abandon_epic,
-    approve_epic,
-    create_epic,
-    create_project,
+    create_bot,
     create_task,
-    get_epic,
+    create_user,
+    get_dm,
     get_task,
-    list_epics,
-    list_projects,
+    get_user,
+    list_bots,
     list_tasks,
     parse_task_edit_document,
-    project_config,
-    resolve_project,
+    rename_principal,
+    resolve_bot,
     status_overview,
     task_edit_document,
-    update_project_config,
+    task_messages,
     update_task_from_edit,
 )
 
@@ -45,12 +47,11 @@ from myai.teams.store import (
 def register(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "teams",
-        help="Agentic teams board (SQLite; no daemon required for view/edit)",
+        help="Agentic teams: long-lived bots (state only; nothing runs without the daemon)",
     )
     teams_sub = parser.add_subparsers(dest="teams_command", required=True)
     _register_init(teams_sub)
-    _register_project(teams_sub)
-    _register_epic(teams_sub)
+    _register_bot(teams_sub)
     _register_task(teams_sub)
     _register_status(teams_sub)
     parser.set_defaults(func=run)
@@ -61,76 +62,27 @@ def run(args: argparse.Namespace) -> int:
 
 
 def _register_init(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser(
-        "init",
-        help="Create teams DB and register the first project",
-    )
-    p.add_argument("--name", help="Project name (default: directory name)")
-    p.add_argument(
-        "--path",
-        default=".",
-        help="Workspace path (default: cwd)",
-    )
+    p = subparsers.add_parser("init", help="Create the teams DB and register you")
+    p.add_argument("--user", help="Your display name (default: login name)")
     p.set_defaults(func=run_init)
 
 
-def _register_project(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("project", help="Manage projects")
-    sub = p.add_subparsers(dest="project_command", required=True)
+def _register_bot(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("bot", help="Manage bots")
+    sub = p.add_subparsers(dest="bot_command", required=True)
 
-    new_p = sub.add_parser("new", help="Register a new project")
-    new_p.add_argument("--name", help="Project name (default: directory name)")
-    new_p.add_argument("--path", default=".", help="Workspace path")
-    new_p.set_defaults(func=run_project_new)
+    new_p = sub.add_parser("new", help="Register a bot and create its home")
+    new_p.add_argument("name", help="Display name")
+    new_p.add_argument("--id", help="Bot id (default: derived from the name)")
+    new_p.add_argument("--job", default="", help="One line on what this bot is for")
+    new_p.set_defaults(func=run_bot_new)
 
-    edit_p = sub.add_parser("edit", help="Edit project config in $EDITOR (YAML)")
-    edit_p.add_argument(
-        "name",
-        nargs="?",
-        help="Project name (default: sole project)",
-    )
-    edit_p.set_defaults(func=run_project_edit)
+    edit_p = sub.add_parser("edit", help=f"Edit a bot's {BOT_CONFIG_FILE} in $EDITOR")
+    edit_p.add_argument("bot", nargs="?", help="Bot id (default: sole bot)")
+    edit_p.set_defaults(func=run_bot_edit)
 
-    list_p = sub.add_parser("list", help="List projects")
-    list_p.set_defaults(func=run_project_list)
-
-    p.set_defaults(func=run)
-
-
-def _register_epic(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("epic", help="Manage epics")
-    sub = p.add_subparsers(dest="epic_command", required=True)
-
-    add_p = sub.add_parser("add", help="Create an epic")
-    add_p.add_argument("--title", required=True)
-    add_p.add_argument("--goal", required=True)
-    add_p.add_argument(
-        "--status",
-        default="grooming",
-        help="Initial status (default: grooming)",
-    )
-    add_p.add_argument("--base-branch", default="main")
-    add_p.add_argument("--project", help="Project name")
-    add_p.set_defaults(func=run_epic_add)
-
-    list_p = sub.add_parser("list", help="List epics")
-    list_p.add_argument("--project", help="Project name")
-    list_p.set_defaults(func=run_epic_list)
-
-    show_p = sub.add_parser("show", help="Show an epic")
-    show_p.add_argument("epic_id", help="E-<id>")
-    show_p.set_defaults(func=run_epic_show)
-
-    approve_p = sub.add_parser(
-        "approve",
-        help="Approve scope (awaiting_approval→executing) or review (→done)",
-    )
-    approve_p.add_argument("epic_id", help="E-<id>")
-    approve_p.set_defaults(func=run_epic_approve)
-
-    abandon_p = sub.add_parser("abandon", help="Abandon an epic")
-    abandon_p.add_argument("epic_id", help="E-<id>")
-    abandon_p.set_defaults(func=run_epic_abandon)
+    list_p = sub.add_parser("list", help="List bots")
+    list_p.set_defaults(func=run_bot_list)
 
     p.set_defaults(func=run)
 
@@ -139,19 +91,10 @@ def _register_task(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("task", help="Manage tasks")
     sub = p.add_subparsers(dest="task_command", required=True)
 
-    add_p = sub.add_parser("add", help="Create a task")
+    add_p = sub.add_parser("add", help="Open a task thread in your DM with a bot")
     add_p.add_argument("--title", required=True)
-    add_p.add_argument("--body", default="")
-    add_p.add_argument("--epic", help="E-<id> (omit for standalone)")
-    add_p.add_argument(
-        "--status",
-        default=None,
-        help="Status (default: draft if --epic else backlog)",
-    )
-    add_p.add_argument("--priority", type=int, default=0)
-    add_p.add_argument("--stage")
-    add_p.add_argument("--role")
-    add_p.add_argument("--project", help="Project name")
+    add_p.add_argument("--body", default="", help="Opening message (default: title)")
+    add_p.add_argument("--bot", help="Owner bot id (default: sole bot)")
     add_p.set_defaults(func=run_task_add)
 
     edit_p = sub.add_parser("edit", help="Edit task in $EDITOR (YAML+markdown)")
@@ -159,11 +102,11 @@ def _register_task(subparsers: argparse._SubParsersAction) -> None:
     edit_p.set_defaults(func=run_task_edit)
 
     list_p = sub.add_parser("list", help="List tasks")
-    list_p.add_argument("--project", help="Project name")
-    list_p.add_argument("--epic", help="Filter by E-<id>")
+    list_p.add_argument("--bot", help="Filter by owner bot id")
+    list_p.add_argument("--status", choices=TASK_STATUSES)
     list_p.set_defaults(func=run_task_list)
 
-    show_p = sub.add_parser("show", help="Show a task")
+    show_p = sub.add_parser("show", help="Show a task and its thread")
     show_p.add_argument("task_id", help="T-<id>")
     show_p.set_defaults(func=run_task_show)
 
@@ -172,242 +115,119 @@ def _register_task(subparsers: argparse._SubParsersAction) -> None:
 
 def _register_status(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
-        "status",
-        help="Board overview: counts, in-flight, queued-by-stage",
-    )
-    p.add_argument(
-        "project",
-        nargs="?",
-        help="Project name (default: sole project)",
+        "status", help="Overview: bots, queued wakes, tasks by status"
     )
     p.set_defaults(func=run_status)
 
 
+def _open() -> sqlite3.Connection:
+    moved = move_aside_pre_pivot()
+    if moved is not None:
+        print(f"note: moved the pre-pivot teams DB aside to {moved}", file=sys.stderr)
+    return open_db()
+
+
 def run_init(args: argparse.Namespace) -> int:
     try:
-        workspace = Path(args.path).resolve()
-        name = args.name or workspace.name
-        conn = open_db()
+        name = args.user or getpass.getuser()
+        conn = _open()
         try:
-            install_default_prompts()
-            if list_projects(conn):
-                print(
-                    "teams DB already has projects; "
-                    "use `myai teams project new` to add another",
-                    file=sys.stderr,
-                )
-                return 1
-            proj = create_project(
-                conn,
-                name=name,
-                workspace_path=str(workspace),
-                config=default_config(),
-            )
+            user = create_user(conn, user_id=slugify(name), name=name)
         finally:
             conn.close()
-    except (StoreError, ConfigError, OSError) as exc:
+    except (StoreError, IdError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print(f"initialized teams DB; project {proj['name']} ({workspace})")
+    print(f"initialized teams DB; user {user['id']}")
     return 0
 
 
-def run_project_new(args: argparse.Namespace) -> int:
+def run_bot_new(args: argparse.Namespace) -> int:
     try:
-        workspace = Path(args.path).resolve()
-        name = args.name or workspace.name
-        conn = open_db()
+        bot_id = parse_principal_id(args.id) if args.id else slugify(args.name)
+        config = default_bot_config(args.name, args.job)
+        conn = _open()
         try:
-            install_default_prompts()
-            proj = create_project(
-                conn,
-                name=name,
-                workspace_path=str(workspace),
-                config=default_config(),
-            )
+            bot = create_bot(conn, bot_id=bot_id, name=config["name"])
         finally:
             conn.close()
-    except (StoreError, ConfigError, OSError) as exc:
+        home = ensure_bot_home(bot_id, config)
+    except (StoreError, IdError, ConfigError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print(f"created project {proj['name']} ({workspace})")
+    print(f"created bot {bot['id']} ({home})")
     return 0
 
 
-def run_project_edit(args: argparse.Namespace) -> int:
+def run_bot_edit(args: argparse.Namespace) -> int:
     try:
-        conn = open_db()
+        conn = _open()
         try:
-            proj = resolve_project(conn, args.name)
-            cfg = project_config(proj)
-            new_cfg = edit_text(
-                config_to_yaml(cfg), suffix=".yaml", parse=config_from_yaml
+            bot = resolve_bot(conn, args.bot)
+            ensure_bot_home(bot["id"], default_bot_config(bot["name"]))
+            path = teams_bot_home(bot["id"]) / BOT_CONFIG_FILE
+            # written back verbatim: the file is the user's, comments included
+            edited, config = edit_text(
+                path.read_text(encoding="utf-8"),
+                suffix=".yaml",
+                parse=lambda t: (t, bot_config_from_yaml(t)),
             )
-            update_project_config(conn, proj["id"], new_cfg)
+            path.write_text(edited, encoding="utf-8")
+            if config["name"] != bot["name"]:
+                rename_principal(conn, bot["id"], config["name"])
         finally:
             conn.close()
-    except EditorError as exc:
+    except (EditorError, StoreError, ConfigError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except (StoreError, ConfigError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(f"updated project {proj['name']} config")
+    print(f"updated bot {bot['id']}")
     return 0
 
 
-def run_project_list(args: argparse.Namespace) -> int:
+def run_bot_list(args: argparse.Namespace) -> int:
     try:
-        conn = open_db()
+        conn = _open()
         try:
-            rows = list_projects(conn)
+            rows = list_bots(conn)
         finally:
             conn.close()
     except StoreError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not rows:
-        print("no projects")
+        print("no bots")
         return 0
     for row in rows:
-        print(f"{row['id']}\t{row['name']}\t{row['workspace_path']}")
-    return 0
-
-
-def run_epic_add(args: argparse.Namespace) -> int:
-    try:
-        conn = open_db()
         try:
-            proj = resolve_project(conn, args.project)
-            epic = create_epic(
-                conn,
-                project_id=proj["id"],
-                title=args.title,
-                goal=args.goal,
-                base_branch=args.base_branch,
-                status=args.status,
-            )
-        finally:
-            conn.close()
-    except (StoreError, IdError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(f"{format_epic_id(epic['id'])}\t{epic['status']}\t{epic['title']}")
-    return 0
-
-
-def run_epic_list(args: argparse.Namespace) -> int:
-    try:
-        conn = open_db()
-        try:
-            proj = resolve_project(conn, args.project)
-            rows = list_epics(conn, proj["id"])
-        finally:
-            conn.close()
-    except (StoreError, IdError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    if not rows:
-        print("no epics")
-        return 0
-    for row in rows:
-        print(
-            f"{format_epic_id(row['id'])}\t{row['status']}\t"
-            f"{row['title']}\tproject={row['project_id']}"
-        )
-    return 0
-
-
-def run_epic_show(args: argparse.Namespace) -> int:
-    try:
-        epic_id = parse_epic_id(args.epic_id)
-        conn = open_db()
-        try:
-            epic = get_epic(conn, epic_id)
-            tasks = list_tasks(conn, epic_id=epic_id)
-        finally:
-            conn.close()
-    except (StoreError, IdError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(f"id:      {format_epic_id(epic['id'])}")
-    print(f"title:   {epic['title']}")
-    print(f"status:  {epic['status']}")
-    print(f"branch:  {epic['branch'] or '-'}")
-    print(f"base:    {epic['base_branch']}")
-    print(f"version: {epic['version']}")
-    print(f"goal:\n{epic['goal']}")
-    if tasks:
-        print("tasks:")
-        for t in tasks:
-            print(
-                f"  {format_task_id(t['id'])}\t{t['status']}\t{t['title']}"
-            )
-    return 0
-
-
-def run_epic_approve(args: argparse.Namespace) -> int:
-    try:
-        epic_id = parse_epic_id(args.epic_id)
-        conn = open_db()
-        try:
-            epic = approve_epic(conn, epic_id)
-        finally:
-            conn.close()
-    except (StoreError, IdError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(f"{format_epic_id(epic['id'])} approved → {epic['status']}")
-    return 0
-
-
-def run_epic_abandon(args: argparse.Namespace) -> int:
-    try:
-        epic_id = parse_epic_id(args.epic_id)
-        conn = open_db()
-        try:
-            epic = abandon_epic(conn, epic_id)
-        finally:
-            conn.close()
-    except (StoreError, IdError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(f"{format_epic_id(epic['id'])} abandoned")
+            job = load_bot_config(row["id"])["job"] or "-"
+        except ConfigError:
+            job = f"(unreadable {BOT_CONFIG_FILE})"
+        print(f"{row['id']}\t{row['name']}\t{job}")
     return 0
 
 
 def run_task_add(args: argparse.Namespace) -> int:
     try:
-        conn = open_db()
+        conn = _open()
         try:
-            proj = resolve_project(conn, args.project)
-            epic_id = parse_epic_id(args.epic) if args.epic else None
-            if args.status:
-                status = args.status
-            else:
-                status = "draft" if epic_id is not None else "backlog"
+            user = get_user(conn)
+            bot = resolve_bot(conn, args.bot)
             task = create_task(
                 conn,
-                project_id=proj["id"],
+                conversation_id=get_dm(conn, user["id"], bot["id"])["id"],
                 title=args.title,
+                created_by=user["id"],
+                owner_id=bot["id"],
                 body=args.body,
-                epic_id=epic_id,
-                status=status,
-                stage=args.stage,
-                role=args.role,
-                priority=args.priority,
             )
         finally:
             conn.close()
-    except (StoreError, IdError) as exc:
+    except StoreError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    epic_s = (
-        format_epic_id(task["epic_id"]) if task["epic_id"] else "standalone"
-    )
     print(
         f"{format_task_id(task['id'])}\t{task['status']}\t"
-        f"{task['title']}\t{epic_s}"
+        f"{task['owner_id']}\t{task['title']}"
     )
     return 0
 
@@ -415,52 +235,43 @@ def run_task_add(args: argparse.Namespace) -> int:
 def run_task_edit(args: argparse.Namespace) -> int:
     try:
         task_id = parse_task_id(args.task_id)
-        conn = open_db()
+        conn = _open()
         try:
-            task = get_task(conn, task_id)
-            fields = edit_text(
-                task_edit_document(task),
+            # apply inside parse so a rejected update keeps the edited file
+            task = edit_text(
+                task_edit_document(get_task(conn, task_id)),
                 suffix=".md",
-                parse=parse_task_edit_document,
+                parse=lambda text: update_task_from_edit(
+                    conn, task_id, **parse_task_edit_document(text)
+                ),
             )
-            task = update_task_from_edit(conn, task_id, **fields)
         finally:
             conn.close()
-    except EditorError as exc:
+    except (EditorError, StoreError, IdError, ConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except (StoreError, IdError, ConfigError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(
-        f"{format_task_id(task['id'])} updated (version {task['version']})"
-    )
+    print(f"{format_task_id(task['id'])} updated (version {task['version']})")
     return 0
 
 
 def run_task_list(args: argparse.Namespace) -> int:
     try:
-        conn = open_db()
+        conn = _open()
         try:
-            proj = resolve_project(conn, args.project)
-            epic_id = parse_epic_id(args.epic) if args.epic else None
-            rows = list_tasks(
-                conn, project_id=proj["id"], epic_id=epic_id
-            )
+            owner = resolve_bot(conn, args.bot)["id"] if args.bot else None
+            rows = list_tasks(conn, owner_id=owner, status=args.status)
         finally:
             conn.close()
-    except (StoreError, IdError) as exc:
+    except StoreError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not rows:
         print("no tasks")
         return 0
     for row in rows:
-        epic_s = format_epic_id(row["epic_id"]) if row["epic_id"] else "-"
-        stage = row["stage"] or "-"
         print(
             f"{format_task_id(row['id'])}\t{row['status']}\t"
-            f"p={row['priority']}\t{stage}\t{epic_s}\t{row['title']}"
+            f"{row['owner_id'] or '-'}\t{row['title']}"
         )
     return 0
 
@@ -468,70 +279,53 @@ def run_task_list(args: argparse.Namespace) -> int:
 def run_task_show(args: argparse.Namespace) -> int:
     try:
         task_id = parse_task_id(args.task_id)
-        conn = open_db()
+        conn = _open()
         try:
             task = get_task(conn, task_id)
+            messages = task_messages(conn, task_id)
         finally:
             conn.close()
     except (StoreError, IdError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    blocked = task["blocked_by"] or "[]"
-    print(f"id:         {format_task_id(task['id'])}")
-    print(f"title:      {task['title']}")
-    print(f"status:     {task['status']}")
-    print(f"priority:   {task['priority']}")
-    print(f"stage:      {task['stage'] or '-'}")
-    print(f"role:       {task['role'] or '-'}")
-    print(
-        f"epic:       "
-        f"{format_epic_id(task['epic_id']) if task['epic_id'] else '-'}"
-    )
-    print(f"version:    {task['version']}")
-    print(f"loop_count: {task['loop_count']}")
-    print(f"blocked_by: {blocked}")
-    print(f"body:\n{task['body']}")
+    print(f"id:       {format_task_id(task['id'])}")
+    print(f"title:    {task['title']}")
+    print(f"status:   {task['status']}")
+    print(f"owner:    {task['owner_id'] or '-'}")
+    print(f"version:  {task['version']}")
+    print(f"handoff:\n{task['handoff'] or '(none)'}")
+    print("thread:")
+    for msg in messages:
+        print(f"  [{msg['created_at']}] {msg['sender_id']}: {msg['body']}")
     return 0
 
 
 def run_status(args: argparse.Namespace) -> int:
     try:
-        conn = open_db()
+        conn = _open()
         try:
-            proj = resolve_project(conn, args.project)
-            overview = status_overview(conn, proj["id"])
+            user = get_user(conn)
+            overview = status_overview(conn)
         finally:
             conn.close()
     except StoreError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"project: {proj['name']}")
-    print("epics:")
-    if overview["epic_counts"]:
-        for status, n in sorted(overview["epic_counts"].items()):
-            print(f"  {status}: {n}")
+    print(f"user: {user['id']}")
+    print("bots:")
+    if overview["bots"]:
+        for bot in overview["bots"]:
+            print(
+                f"  {bot['id']}\tqueued wakes: {bot['pending']}\t"
+                f"open tasks: {bot['open_tasks']}"
+            )
     else:
         print("  (none)")
     print("tasks:")
     if overview["task_counts"]:
         for status, n in sorted(overview["task_counts"].items()):
             print(f"  {status}: {n}")
-    else:
-        print("  (none)")
-    print("in-flight:")
-    if overview["in_flight"]:
-        for t in overview["in_flight"]:
-            stage = t["stage"] or "-"
-            print(
-                f"  {format_task_id(t['id'])}\t{stage}\t{t['title']}"
-            )
-    else:
-        print("  (none)")
-    print("queued-by-stage (ready):")
-    if overview["queued_by_stage"]:
-        for stage, n in overview["queued_by_stage"].items():
-            print(f"  {stage}: {n}")
     else:
         print("  (none)")
     return 0

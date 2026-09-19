@@ -1,97 +1,140 @@
-CREATE TABLE projects (
-  id            INTEGER PRIMARY KEY,
+-- Users and bots share one id space, so conversations are N-participant from day one.
+CREATE TABLE principals (
+  id            TEXT PRIMARY KEY,
+  kind          TEXT NOT NULL CHECK (kind IN ('user', 'bot')),
   name          TEXT NOT NULL,
-  workspace_path TEXT NOT NULL,
-  config_json   TEXT NOT NULL
+  created_at    TEXT NOT NULL
 );
 
-CREATE TABLE epics (
+-- A bot's address book is an ACL: sends to anyone not listed are rejected.
+CREATE TABLE contacts (
+  bot_id        TEXT NOT NULL REFERENCES principals(id),
+  contact_id    TEXT NOT NULL REFERENCES principals(id),
+  PRIMARY KEY (bot_id, contact_id)
+);
+
+CREATE TABLE conversations (
   id            INTEGER PRIMARY KEY,
-  project_id    INTEGER NOT NULL REFERENCES projects(id),
-  title         TEXT NOT NULL,
-  goal          TEXT NOT NULL,
-  status        TEXT NOT NULL,
-  branch        TEXT,
-  base_branch   TEXT NOT NULL,
-  version       INTEGER NOT NULL DEFAULT 1,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
+  kind          TEXT NOT NULL CHECK (kind IN ('dm', 'group')),
+  team_id       INTEGER,
+  title         TEXT,
+  created_at    TEXT NOT NULL
+);
+
+-- Membership controls visibility.
+CREATE TABLE participants (
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  principal_id    TEXT NOT NULL REFERENCES principals(id),
+  joined_at       TEXT NOT NULL,
+  PRIMARY KEY (conversation_id, principal_id)
 );
 
 CREATE TABLE tasks (
-  id            INTEGER PRIMARY KEY,
-  project_id    INTEGER NOT NULL REFERENCES projects(id),
-  epic_id       INTEGER REFERENCES epics(id),
-  title         TEXT NOT NULL,
-  body          TEXT NOT NULL,
-  status        TEXT NOT NULL,
-  stage         TEXT,
-  role          TEXT,
-  priority      INTEGER NOT NULL DEFAULT 0,
-  blocked_by    TEXT,
-  gate          TEXT,
-  version       INTEGER NOT NULL DEFAULT 1,
-  loop_count    INTEGER NOT NULL DEFAULT 0,
-  branch        TEXT,
-  worktree_path TEXT,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
+  id              INTEGER PRIMARY KEY,
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  title           TEXT NOT NULL,
+  owner_id        TEXT REFERENCES principals(id),
+  status          TEXT NOT NULL CHECK (
+    status IN ('open', 'active', 'blocked', 'needs_input', 'done', 'dropped')
+  ),
+  handoff         TEXT NOT NULL DEFAULT '',
+  created_by      TEXT NOT NULL REFERENCES principals(id),
+  version         INTEGER NOT NULL DEFAULT 1,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
 );
 
-CREATE TABLE runs (
+CREATE TABLE messages (
+  id              INTEGER PRIMARY KEY,
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  task_id         INTEGER REFERENCES tasks(id),
+  sender_id       TEXT NOT NULL REFERENCES principals(id),
+  body            TEXT NOT NULL,
+  created_at      TEXT NOT NULL
+);
+
+CREATE INDEX messages_conversation ON messages(conversation_id, id);
+CREATE INDEX messages_task ON messages(task_id) WHERE task_id IS NOT NULL;
+
+-- Addressing controls waking.
+CREATE TABLE message_recipients (
+  message_id    INTEGER NOT NULL REFERENCES messages(id),
+  principal_id  TEXT NOT NULL REFERENCES principals(id),
+  PRIMARY KEY (message_id, principal_id)
+);
+
+-- Lowest priority value wakes first, then oldest.
+CREATE TABLE mailbox (
   id            INTEGER PRIMARY KEY,
-  task_id       INTEGER NOT NULL REFERENCES tasks(id),
-  stage         TEXT NOT NULL,
-  backend       TEXT NOT NULL,
-  task_version  INTEGER NOT NULL,
-  started_at    TEXT,
+  bot_id        TEXT NOT NULL REFERENCES principals(id),
+  kind          TEXT NOT NULL CHECK (
+    kind IN ('user_message', 'job_event', 'bot_message', 'schedule')
+  ),
+  ref_id        INTEGER,
+  priority      INTEGER NOT NULL,
+  enqueued_at   TEXT NOT NULL,
+  claimed_at    TEXT,
+  done_at       TEXT
+);
+
+CREATE INDEX mailbox_pending ON mailbox(bot_id, priority, id) WHERE done_at IS NULL;
+
+-- A wake or a job runs one or more sessions; a session can roll over.
+CREATE TABLE sessions (
+  id            INTEGER PRIMARY KEY,
+  bot_id        TEXT NOT NULL REFERENCES principals(id),
+  mailbox_id    INTEGER REFERENCES mailbox(id),
+  job_id        INTEGER,
+  route         TEXT NOT NULL,
+  daemon_epoch  TEXT NOT NULL,
+  started_at    TEXT NOT NULL,
   ended_at      TEXT,
-  outcome       TEXT,
-  result_json   TEXT,
-  transcript_path TEXT,
-  worktree_path TEXT,
-  branch        TEXT,
-  daemon_epoch  TEXT,
-  pid           INTEGER,
-  pgid          INTEGER,
-  proc_start    TEXT
+  end_reason    TEXT CHECK (
+    end_reason IN ('done', 'rollover', 'compact', 'parked', 'error')
+  )
 );
 
+-- The episodic log. origin is set by the harness, never by the model.
+CREATE TABLE turns (
+  id            INTEGER PRIMARY KEY,
+  session_id    INTEGER NOT NULL REFERENCES sessions(id),
+  seq           INTEGER NOT NULL,
+  role          TEXT NOT NULL,
+  content_json  TEXT NOT NULL,
+  origin        TEXT NOT NULL CHECK (origin IN ('first_hand', 'recalled')),
+  model         TEXT,
+  tokens_in     INTEGER,
+  tokens_out    INTEGER,
+  event_time    TEXT NOT NULL,
+  UNIQUE (session_id, seq)
+);
+
+-- Append-only; clients sync from it with a cursor.
 CREATE TABLE events (
   id            INTEGER PRIMARY KEY,
-  project_id    INTEGER NOT NULL,
-  task_id       INTEGER,
   ts            TEXT NOT NULL,
   kind          TEXT NOT NULL,
   payload_json  TEXT
 );
 
-CREATE TABLE approvals (
-  id            INTEGER PRIMARY KEY,
-  task_id       INTEGER,
-  epic_id       INTEGER,
-  project_id    INTEGER NOT NULL,
-  kind          TEXT NOT NULL,
-  summary       TEXT NOT NULL,
-  requested_at  TEXT NOT NULL,
-  resolved_at   TEXT,
-  applied_at    TEXT,
-  decision      TEXT,
-  human_note    TEXT,
-  payload_json  TEXT
-);
+-- The fact store is rebuilt from turns and clients replay events, so neither
+-- may change after the fact.
+CREATE TRIGGER turns_no_update BEFORE UPDATE ON turns
+BEGIN
+  SELECT RAISE(ABORT, 'turns are immutable');
+END;
 
-CREATE UNIQUE INDEX approvals_open_task ON approvals(task_id)
-  WHERE resolved_at IS NULL AND task_id IS NOT NULL;
-CREATE UNIQUE INDEX approvals_open_epic ON approvals(epic_id)
-  WHERE resolved_at IS NULL AND epic_id IS NOT NULL;
+CREATE TRIGGER turns_no_delete BEFORE DELETE ON turns
+BEGIN
+  SELECT RAISE(ABORT, 'turns are immutable');
+END;
 
-CREATE TABLE messages (
-  id            INTEGER PRIMARY KEY,
-  project_id    INTEGER NOT NULL,
-  epic_id       INTEGER REFERENCES epics(id),
-  direction     TEXT NOT NULL,
-  body          TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
-  processed_at  TEXT
-);
+CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+BEGIN
+  SELECT RAISE(ABORT, 'events are append-only');
+END;
+
+CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+BEGIN
+  SELECT RAISE(ABORT, 'events are append-only');
+END;

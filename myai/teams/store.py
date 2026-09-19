@@ -2,25 +2,26 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import yaml
 
-from myai.teams.config import (
-    EPIC_STATUSES,
-    TASK_STATUSES,
-    ConfigError,
-    config_from_json,
-    config_to_json,
-    default_config,
-    validate_config,
-)
+from myai.teams.config import TASK_STATUSES, ConfigError
 from myai.teams.db import TeamsDBError
-from myai.teams.ids import format_epic_id, format_task_id
+from myai.teams.ids import format_task_id
 
-# Stub fields in the task edit doc — shown for context / future use; not applied.
-_EDIT_STUB_FIELDS = ("epic_id", "version", "loop_count")
+# Lower wakes sooner: the human first, then the bot's own jobs, then other bots.
+MAILBOX_PRIORITY = {
+    "user_message": 0,
+    "job_event": 1,
+    "bot_message": 2,
+    "schedule": 3,
+}
+
+_CLOSED_STATUSES = ("done", "dropped")
 
 
 def _now() -> str:
@@ -31,225 +32,236 @@ class StoreError(TeamsDBError):
     pass
 
 
-# --- projects ---
+@contextmanager
+def _txn(conn: sqlite3.Connection) -> Iterator[None]:
+    """Commit the block as one transaction, so a change and its events land together."""
+    try:
+        yield
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
-def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return list(
-        conn.execute("SELECT * FROM projects ORDER BY id")
+def _event(conn: sqlite3.Connection, kind: str, /, **payload: Any) -> None:
+    conn.execute(
+        "INSERT INTO events(ts, kind, payload_json) VALUES (?, ?, ?)",
+        (_now(), kind, json.dumps(payload)),
     )
 
 
-def get_project(
-    conn: sqlite3.Connection, *, project_id: int | None = None, name: str | None = None
-) -> sqlite3.Row:
-    if project_id is not None:
-        row = conn.execute(
-            "SELECT * FROM projects WHERE id = ?", (project_id,)
-        ).fetchone()
-    elif name is not None:
-        row = conn.execute(
-            "SELECT * FROM projects WHERE name = ?", (name,)
-        ).fetchone()
-    else:
-        raise StoreError("project id or name required")
+# --- principals ---
+
+
+def get_principal(conn: sqlite3.Connection, principal_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM principals WHERE id = ?", (principal_id,)
+    ).fetchone()
     if row is None:
-        raise StoreError("project not found")
+        raise StoreError(f"no user or bot with id {principal_id!r}")
     return row
 
 
-def resolve_project(
-    conn: sqlite3.Connection, name_or_none: str | None
-) -> sqlite3.Row:
-    if name_or_none:
-        return get_project(conn, name=name_or_none)
-    rows = list_projects(conn)
-    if not rows:
-        raise StoreError("no projects; run myai teams init")
-    if len(rows) > 1:
-        raise StoreError(
-            "multiple projects; pass PROJECT name"
+def get_user(conn: sqlite3.Connection) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM principals WHERE kind = 'user' ORDER BY created_at LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise StoreError("no user; run `myai teams init`")
+    return row
+
+
+def create_user(conn: sqlite3.Connection, *, user_id: str, name: str) -> sqlite3.Row:
+    existing = conn.execute(
+        "SELECT id FROM principals WHERE kind = 'user'"
+    ).fetchone()
+    if existing is not None:
+        raise StoreError(f"teams is already initialized (user {existing['id']})")
+    with _txn(conn):
+        conn.execute(
+            "INSERT INTO principals(id, kind, name, created_at) VALUES (?, 'user', ?, ?)",
+            (user_id, name, _now()),
         )
+        _event(conn, "principal_created", id=user_id, kind="user")
+    return get_principal(conn, user_id)
+
+
+def list_bots(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(
+        conn.execute("SELECT * FROM principals WHERE kind = 'bot' ORDER BY created_at, id")
+    )
+
+
+def resolve_bot(conn: sqlite3.Connection, id_or_none: str | None) -> sqlite3.Row:
+    if id_or_none:
+        row = get_principal(conn, id_or_none)
+        if row["kind"] != "bot":
+            raise StoreError(f"{id_or_none!r} is not a bot")
+        return row
+    rows = list_bots(conn)
+    if not rows:
+        raise StoreError("no bots; run `myai teams bot new`")
+    if len(rows) > 1:
+        raise StoreError("multiple bots; pass a bot id")
     return rows[0]
 
 
-def create_project(
-    conn: sqlite3.Connection,
-    *,
-    name: str,
-    workspace_path: str,
-    config: dict[str, Any] | None = None,
-) -> sqlite3.Row:
-    cfg = validate_config(config if config is not None else default_config())
-    try:
-        cur = conn.execute(
-            "INSERT INTO projects(name, workspace_path, config_json) VALUES (?, ?, ?)",
-            (name, workspace_path, config_to_json(cfg)),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError as exc:
-        conn.rollback()
-        raise StoreError(f"project {name!r} already exists") from exc
-    return get_project(conn, project_id=cur.lastrowid)
-
-
-def update_project_config(
-    conn: sqlite3.Connection, project_id: int, config: dict[str, Any]
-) -> sqlite3.Row:
-    cfg = validate_config(config)
-    conn.execute(
-        "UPDATE projects SET config_json = ? WHERE id = ?",
-        (config_to_json(cfg), project_id),
-    )
-    conn.commit()
-    return get_project(conn, project_id=project_id)
-
-
-def project_config(row: sqlite3.Row) -> dict[str, Any]:
-    return config_from_json(row["config_json"])
-
-
-# --- epics ---
-
-
-def create_epic(
-    conn: sqlite3.Connection,
-    *,
-    project_id: int,
-    title: str,
-    goal: str,
-    base_branch: str = "main",
-    status: str = "grooming",
-) -> sqlite3.Row:
-    if status not in EPIC_STATUSES:
-        raise StoreError(f"invalid epic status: {status}")
+def create_bot(conn: sqlite3.Connection, *, bot_id: str, name: str) -> sqlite3.Row:
+    """Register a bot, put the user in its address book, and open their DM."""
+    user = get_user(conn)
     now = _now()
-    cur = conn.execute(
-        """
-        INSERT INTO epics(
-          project_id, title, goal, status, branch, base_branch,
-          version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?)
-        """,
-        (project_id, title, goal, status, base_branch, now, now),
-    )
-    conn.commit()
-    return get_epic(conn, cur.lastrowid)
+    try:
+        with _txn(conn):
+            conn.execute(
+                "INSERT INTO principals(id, kind, name, created_at) VALUES (?, 'bot', ?, ?)",
+                (bot_id, name, now),
+            )
+            conn.execute(
+                "INSERT INTO contacts(bot_id, contact_id) VALUES (?, ?)",
+                (bot_id, user["id"]),
+            )
+            cur = conn.execute(
+                "INSERT INTO conversations(kind, created_at) VALUES ('dm', ?)", (now,)
+            )
+            conn.executemany(
+                "INSERT INTO participants(conversation_id, principal_id, joined_at) "
+                "VALUES (?, ?, ?)",
+                [(cur.lastrowid, user["id"], now), (cur.lastrowid, bot_id, now)],
+            )
+            _event(conn, "principal_created", id=bot_id, kind="bot")
+            _event(conn, "conversation_created", id=cur.lastrowid, kind="dm")
+    except sqlite3.IntegrityError as exc:
+        raise StoreError(f"id {bot_id!r} is already taken") from exc
+    return get_principal(conn, bot_id)
 
 
-def get_epic(conn: sqlite3.Connection, epic_id: int) -> sqlite3.Row:
+def rename_principal(conn: sqlite3.Connection, principal_id: str, name: str) -> None:
+    with _txn(conn):
+        conn.execute(
+            "UPDATE principals SET name = ? WHERE id = ?", (name, principal_id)
+        )
+        _event(conn, "principal_renamed", id=principal_id, name=name)
+
+
+# --- conversations and messages ---
+
+
+def get_dm(conn: sqlite3.Connection, a: str, b: str) -> sqlite3.Row:
     row = conn.execute(
-        "SELECT * FROM epics WHERE id = ?", (epic_id,)
+        """
+        SELECT c.* FROM conversations c
+        JOIN participants pa ON pa.conversation_id = c.id AND pa.principal_id = ?
+        JOIN participants pb ON pb.conversation_id = c.id AND pb.principal_id = ?
+        WHERE c.kind = 'dm'
+        """,
+        (a, b),
     ).fetchone()
     if row is None:
-        raise StoreError(f"epic {format_epic_id(epic_id)} not found")
+        raise StoreError(f"no DM between {a!r} and {b!r}")
     return row
 
 
-def list_epics(
-    conn: sqlite3.Connection, project_id: int | None = None
-) -> list[sqlite3.Row]:
-    if project_id is None:
-        return list(
-            conn.execute("SELECT * FROM epics ORDER BY id")
+def _participant_ids(conn: sqlite3.Connection, conversation_id: int) -> set[str]:
+    return {
+        row["principal_id"]
+        for row in conn.execute(
+            "SELECT principal_id FROM participants WHERE conversation_id = ?",
+            (conversation_id,),
         )
+    }
+
+
+def _post_message(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: int,
+    sender_id: str,
+    body: str,
+    recipients: list[str],
+    task_id: int | None,
+) -> int:
+    sender = get_principal(conn, sender_id)
+    members = _participant_ids(conn, conversation_id)
+    if sender_id not in members:
+        raise StoreError(f"{sender_id!r} is not in conversation {conversation_id}")
+    targets = list(dict.fromkeys(recipients))
+    if sender_id in targets:
+        raise StoreError("a message cannot be addressed to its sender")
+    outsiders = [r for r in targets if r not in members]
+    if outsiders:
+        raise StoreError(f"recipients not in conversation {conversation_id}: {outsiders}")
+    if sender["kind"] == "bot":
+        allowed = {
+            row["contact_id"]
+            for row in conn.execute(
+                "SELECT contact_id FROM contacts WHERE bot_id = ?", (sender_id,)
+            )
+        }
+        blocked = [r for r in targets if r not in allowed]
+        if blocked:
+            raise StoreError(f"{sender_id!r} has no contact entry for {blocked}")
+
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO messages(conversation_id, task_id, sender_id, body, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (conversation_id, task_id, sender_id, body, now),
+    )
+    message_id = cur.lastrowid
+    kind = "user_message" if sender["kind"] == "user" else "bot_message"
+    for recipient in targets:
+        conn.execute(
+            "INSERT INTO message_recipients(message_id, principal_id) VALUES (?, ?)",
+            (message_id, recipient),
+        )
+        # only bots have a mailbox; a human reads the conversation
+        if get_principal(conn, recipient)["kind"] == "bot":
+            conn.execute(
+                "INSERT INTO mailbox(bot_id, kind, ref_id, priority, enqueued_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (recipient, kind, message_id, MAILBOX_PRIORITY[kind], now),
+            )
+    _event(
+        conn,
+        "message_posted",
+        id=message_id,
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        task_id=task_id,
+    )
+    return message_id
+
+
+def post_message(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: int,
+    sender_id: str,
+    body: str,
+    recipients: list[str],
+    task_id: int | None = None,
+) -> sqlite3.Row:
+    """Append a message; each addressed bot gets a mailbox item. Addressing wakes."""
+    with _txn(conn):
+        message_id = _post_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            body=body,
+            recipients=recipients,
+            task_id=task_id,
+        )
+    return conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+
+
+def pending_mailbox(conn: sqlite3.Connection, bot_id: str) -> list[sqlite3.Row]:
+    """Unfinished items in wake order."""
     return list(
         conn.execute(
-            "SELECT * FROM epics WHERE project_id = ? ORDER BY id",
-            (project_id,),
+            "SELECT * FROM mailbox WHERE bot_id = ? AND done_at IS NULL "
+            "ORDER BY priority, id",
+            (bot_id,),
         )
-    )
-
-
-def approve_epic(conn: sqlite3.Connection, epic_id: int) -> sqlite3.Row:
-    """DB-only approve: scope approval or final review."""
-    epic = get_epic(conn, epic_id)
-    status = epic["status"]
-    now = _now()
-    if status == "awaiting_approval":
-        conn.execute(
-            """
-            UPDATE epics SET status = 'executing', branch = COALESCE(branch, ?),
-              updated_at = ? WHERE id = ?
-            """,
-            (f"teams/E-{epic_id}", now, epic_id),
-        )
-        conn.execute(
-            """
-            UPDATE tasks SET status = 'backlog', updated_at = ?
-            WHERE epic_id = ? AND status = 'draft'
-            """,
-            (now, epic_id),
-        )
-        _resolve_open_epic_approval(
-            conn, epic_id, epic["project_id"], decision="approved", now=now
-        )
-        conn.commit()
-        return get_epic(conn, epic_id)
-    if status == "awaiting_review":
-        conn.execute(
-            "UPDATE epics SET status = 'done', updated_at = ? WHERE id = ?",
-            (now, epic_id),
-        )
-        _resolve_open_epic_approval(
-            conn, epic_id, epic["project_id"], decision="approved", now=now
-        )
-        conn.commit()
-        return get_epic(conn, epic_id)
-    raise StoreError(
-        f"epic {format_epic_id(epic_id)} status is {status!r}; "
-        "approve only from awaiting_approval or awaiting_review"
-    )
-
-
-def abandon_epic(conn: sqlite3.Connection, epic_id: int) -> sqlite3.Row:
-    epic = get_epic(conn, epic_id)
-    if epic["status"] in ("done", "abandoned"):
-        raise StoreError(
-            f"epic {format_epic_id(epic_id)} is already {epic['status']}"
-        )
-    now = _now()
-    conn.execute(
-        "UPDATE epics SET status = 'abandoned', updated_at = ? WHERE id = ?",
-        (now, epic_id),
-    )
-    _resolve_open_epic_approval(
-        conn,
-        epic_id,
-        epic["project_id"],
-        decision="rejected",
-        now=now,
-        note="abandoned",
-    )
-    conn.commit()
-    return get_epic(conn, epic_id)
-
-
-def _resolve_open_epic_approval(
-    conn: sqlite3.Connection,
-    epic_id: int,
-    project_id: int,
-    *,
-    decision: str,
-    now: str,
-    note: str | None = None,
-) -> None:
-    row = conn.execute(
-        """
-        SELECT id FROM approvals
-        WHERE epic_id = ? AND resolved_at IS NULL
-        """,
-        (epic_id,),
-    ).fetchone()
-    if row is None:
-        return
-    conn.execute(
-        """
-        UPDATE approvals
-        SET resolved_at = ?, applied_at = ?, decision = ?, human_note = ?
-        WHERE id = ?
-        """,
-        (now, now, decision, note, row["id"]),
     )
 
 
@@ -259,56 +271,41 @@ def _resolve_open_epic_approval(
 def create_task(
     conn: sqlite3.Connection,
     *,
-    project_id: int,
+    conversation_id: int,
     title: str,
+    created_by: str,
+    owner_id: str | None = None,
     body: str = "",
-    epic_id: int | None = None,
-    status: str = "backlog",
-    stage: str | None = None,
-    role: str | None = None,
-    priority: int = 0,
-    blocked_by: list[int] | None = None,
 ) -> sqlite3.Row:
-    if status not in TASK_STATUSES:
-        raise StoreError(f"invalid task status: {status}")
-    if epic_id is not None:
-        epic = get_epic(conn, epic_id)
-        if epic["project_id"] != project_id:
-            raise StoreError(
-                f"epic {format_epic_id(epic_id)} belongs to a different project"
-            )
+    """Open a task thread. The opening message is addressed to the owner."""
+    if owner_id is not None and owner_id not in _participant_ids(conn, conversation_id):
+        raise StoreError(f"owner {owner_id!r} is not in conversation {conversation_id}")
     now = _now()
-    blocked_json = json.dumps(blocked_by or [])
-    cur = conn.execute(
-        """
-        INSERT INTO tasks(
-          project_id, epic_id, title, body, status, stage, role,
-          priority, blocked_by, gate, version, loop_count,
-          branch, worktree_path, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, 0, NULL, NULL, ?, ?)
-        """,
-        (
-            project_id,
-            epic_id,
-            title,
-            body,
-            status,
-            stage,
-            role,
-            priority,
-            blocked_json,
-            now,
-            now,
-        ),
-    )
-    conn.commit()
-    return get_task(conn, cur.lastrowid)
+    with _txn(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO tasks(
+              conversation_id, title, owner_id, status, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (conversation_id, title, owner_id, created_by, now, now),
+        )
+        task_id = cur.lastrowid
+        _event(conn, "task_created", id=task_id, owner_id=owner_id)
+        recipients = [owner_id] if owner_id and owner_id != created_by else []
+        _post_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_id=created_by,
+            body=body or title,
+            recipients=recipients,
+            task_id=task_id,
+        )
+    return get_task(conn, task_id)
 
 
 def get_task(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row:
-    row = conn.execute(
-        "SELECT * FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         raise StoreError(f"task {format_task_id(task_id)} not found")
     return row
@@ -317,23 +314,26 @@ def get_task(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row:
 def list_tasks(
     conn: sqlite3.Connection,
     *,
-    project_id: int | None = None,
-    epic_id: int | None = None,
+    owner_id: str | None = None,
+    status: str | None = None,
 ) -> list[sqlite3.Row]:
     clauses: list[str] = []
     params: list[Any] = []
-    if project_id is not None:
-        clauses.append("project_id = ?")
-        params.append(project_id)
-    if epic_id is not None:
-        clauses.append("epic_id = ?")
-        params.append(epic_id)
+    if owner_id is not None:
+        clauses.append("owner_id = ?")
+        params.append(owner_id)
+    if status is not None:
+        if status not in TASK_STATUSES:
+            raise StoreError(f"invalid task status: {status}")
+        clauses.append("status = ?")
+        params.append(status)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return list(conn.execute(f"SELECT * FROM tasks {where} ORDER BY id", params))
+
+
+def task_messages(conn: sqlite3.Connection, task_id: int) -> list[sqlite3.Row]:
     return list(
-        conn.execute(
-            f"SELECT * FROM tasks {where} ORDER BY priority DESC, id",
-            params,
-        )
+        conn.execute("SELECT * FROM messages WHERE task_id = ? ORDER BY id", (task_id,))
     )
 
 
@@ -342,160 +342,48 @@ def update_task_from_edit(
     task_id: int,
     *,
     title: str,
-    body: str,
     status: str,
-    stage: str | None,
-    role: str | None,
-    priority: int,
-    blocked_by: list[int] | None,
-    gate: str | None = None,
-    epic_id: Any = None,
-    version: Any = None,
-    loop_count: Any = None,
+    owner_id: str | None,
+    handoff: str,
+    version: Any,
 ) -> sqlite3.Row:
     if status not in TASK_STATUSES:
         raise StoreError(f"invalid task status: {status}")
     task = get_task(conn, task_id)
-    _reject_stub_mutations(
-        task,
-        epic_id=epic_id,
-        version=version,
-        loop_count=loop_count,
-    )
-    now = _now()
-    conn.execute(
-        """
-        UPDATE tasks SET
-          title = ?, body = ?, status = ?, stage = ?, role = ?,
-          priority = ?, blocked_by = ?, gate = ?,
-          version = version + 1, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            title,
-            body,
-            status,
-            stage,
-            role,
-            priority,
-            json.dumps(blocked_by or []),
-            gate if gate is not None else task["gate"],
-            now,
-            task_id,
-        ),
-    )
-    conn.commit()
+    # the version in the edit doc is the one the editor opened on
+    if version != task["version"]:
+        raise StoreError(
+            f"{format_task_id(task_id)} changed while it was being edited "
+            f"(version {version!r} → {task['version']}); re-run the edit"
+        )
+    if owner_id is not None and owner_id not in _participant_ids(
+        conn, task["conversation_id"]
+    ):
+        raise StoreError(f"owner {owner_id!r} is not in the task's conversation")
+    with _txn(conn):
+        conn.execute(
+            """
+            UPDATE tasks SET
+              title = ?, status = ?, owner_id = ?, handoff = ?,
+              version = version + 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (title, status, owner_id, handoff, _now(), task_id),
+        )
+        _event(conn, "task_updated", id=task_id, status=status, owner_id=owner_id)
     return get_task(conn, task_id)
 
 
-def _reject_stub_mutations(
-    task: sqlite3.Row,
-    *,
-    epic_id: Any,
-    version: Any,
-    loop_count: Any,
-) -> None:
-    """epic_id/version/loop_count are shown in the edit doc but not applied."""
-    expected = {
-        "epic_id": task["epic_id"],
-        "version": task["version"],
-        "loop_count": task["loop_count"],
-    }
-    got = {
-        "epic_id": epic_id,
-        "version": version,
-        "loop_count": loop_count,
-    }
-    for key in _EDIT_STUB_FIELDS:
-        if got[key] != expected[key]:
-            raise StoreError(
-                f"{key} is read-only in the task edit document "
-                f"(got {got[key]!r}, expected {expected[key]!r})"
-            )
-
-
-# --- status overview ---
-
-
-def status_overview(
-    conn: sqlite3.Connection, project_id: int
-) -> dict[str, Any]:
-    epic_counts: dict[str, int] = {}
-    for row in conn.execute(
-        """
-        SELECT status, COUNT(*) AS n FROM epics
-        WHERE project_id = ? GROUP BY status
-        """,
-        (project_id,),
-    ):
-        epic_counts[row["status"]] = row["n"]
-
-    task_counts: dict[str, int] = {}
-    for row in conn.execute(
-        """
-        SELECT status, COUNT(*) AS n FROM tasks
-        WHERE project_id = ? GROUP BY status
-        """,
-        (project_id,),
-    ):
-        task_counts[row["status"]] = row["n"]
-
-    in_flight = list(
-        conn.execute(
-            """
-            SELECT id, title, stage, role FROM tasks
-            WHERE project_id = ? AND status = 'running'
-            ORDER BY id
-            """,
-            (project_id,),
-        )
-    )
-
-    queued_by_stage: dict[str, int] = {}
-    for row in conn.execute(
-        """
-        SELECT COALESCE(stage, '(none)') AS stage, COUNT(*) AS n
-        FROM tasks
-        WHERE project_id = ? AND status = 'ready'
-        GROUP BY stage
-        ORDER BY stage
-        """,
-        (project_id,),
-    ):
-        queued_by_stage[row["stage"]] = row["n"]
-
-    return {
-        "epic_counts": epic_counts,
-        "task_counts": task_counts,
-        "in_flight": in_flight,
-        "queued_by_stage": queued_by_stage,
-    }
-
-
 def task_edit_document(row: sqlite3.Row) -> str:
-    """YAML frontmatter + markdown body for $EDITOR round-trip."""
-    blocked = []
-    if row["blocked_by"]:
-        try:
-            blocked = json.loads(row["blocked_by"])
-        except json.JSONDecodeError as exc:
-            raise ConfigError("blocked_by is not valid JSON") from exc
-
+    """YAML frontmatter + the handoff note as markdown, for the $EDITOR round-trip."""
     meta = {
         "title": row["title"],
         "status": row["status"],
-        "priority": row["priority"],
-        "stage": row["stage"],
-        "role": row["role"],
-        "blocked_by": blocked,
+        "owner": row["owner_id"],
+        "version": row["version"],
     }
-    # drop nulls for editable fields; always emit stub fields (incl. null epic_id)
-    meta = {k: v for k, v in meta.items() if v is not None}
-    meta["epic_id"] = row["epic_id"]
-    meta["version"] = row["version"]
-    meta["loop_count"] = row["loop_count"]
     fm = yaml.safe_dump(meta, default_flow_style=False, sort_keys=False)
-    return f"---\n{fm}---\n\n{row['body']}"
+    return f"---\n{fm}---\n\n{row['handoff']}"
 
 
 def parse_task_edit_document(text: str) -> dict[str, Any]:
@@ -510,43 +398,51 @@ def parse_task_edit_document(text: str) -> dict[str, Any]:
     if end < 0:
         raise ConfigError("missing closing --- for frontmatter")
     fm_text = rest[:end]
-    body = rest[end + 4 :]
-    if body.startswith("\r\n"):
-        body = body[2:]
-    elif body.startswith("\n"):
-        body = body[1:]
+    # the document puts a blank line after the frontmatter; don't grow the note by it
+    body = rest[end + 4 :].lstrip("\r\n")
     meta = yaml.safe_load(fm_text) or {}
     if not isinstance(meta, dict):
         raise ConfigError("frontmatter must be a mapping")
     title = meta.get("title")
     if not isinstance(title, str) or not title.strip():
         raise ConfigError("title is required in frontmatter")
-    status = meta.get("status", "backlog")
+    status = meta.get("status", "open")
     if status not in TASK_STATUSES:
-        raise ConfigError(f"invalid status: {status}")
-    priority = meta.get("priority", 0)
-    if not isinstance(priority, int):
-        raise ConfigError("priority must be an int")
-    blocked = meta.get("blocked_by") or []
-    if not isinstance(blocked, list):
-        raise ConfigError("blocked_by must be a list")
-    blocked_ids: list[int] = []
-    for entry in blocked:
-        try:
-            blocked_ids.append(int(entry))
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(
-                f"blocked_by entries must be task ids, got {entry!r}"
-            ) from exc
+        raise ConfigError(f"invalid status {status!r}; one of {list(TASK_STATUSES)}")
+    owner = meta.get("owner")
+    if owner is not None and not isinstance(owner, str):
+        raise ConfigError("owner must be a user or bot id, or null")
     return {
         "title": title.strip(),
-        "body": body,
         "status": status,
-        "stage": meta.get("stage"),
-        "role": meta.get("role"),
-        "priority": priority,
-        "blocked_by": blocked_ids,
-        "epic_id": meta.get("epic_id"),
+        "owner_id": owner,
+        "handoff": body,
         "version": meta.get("version"),
-        "loop_count": meta.get("loop_count"),
     }
+
+
+# --- status overview ---
+
+
+def status_overview(conn: sqlite3.Connection) -> dict[str, Any]:
+    task_counts = {
+        row["status"]: row["n"]
+        for row in conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status")
+    }
+    placeholders = ", ".join("?" for _ in _CLOSED_STATUSES)
+    bots = []
+    for bot in list_bots(conn):
+        open_tasks = conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE owner_id = ? "
+            f"AND status NOT IN ({placeholders})",
+            (bot["id"], *_CLOSED_STATUSES),
+        ).fetchone()[0]
+        bots.append(
+            {
+                "id": bot["id"],
+                "name": bot["name"],
+                "pending": len(pending_mailbox(conn, bot["id"])),
+                "open_tasks": open_tasks,
+            }
+        )
+    return {"bots": bots, "task_counts": task_counts}

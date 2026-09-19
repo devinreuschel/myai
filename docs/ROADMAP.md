@@ -171,16 +171,21 @@ Make myai a clean backend for agentic tools and remote use.
 
 Step one. The unmerged `agentic-teams` branch holds a board skeleton for the superseded pipeline design; land it and reshape it. Design: [docs/agentic-teams-design.md](agentic-teams-design.md). Phases 13–16 together are v1.
 
-- [ ] Merge `agentic-teams` into `main`; resolve `CHANGELOG`, `cli.py`, `paths.py`, and `ROADMAP` conflicts, keeping these roadmap phases
-- [ ] Keep: SQLite layer (`busy_timeout` before WAL, transactional migrations), `teams_*` path helpers, `$EDITOR` round-trip, the `teams` command group, PyYAML
-- [ ] Replace the pipeline schema with a fresh `001`: `principals`, `contacts`, `conversations`, `participants`, `messages`, `message_recipients`, `tasks`, `mailbox`, `sessions`, `turns`, `events`
-- [ ] N-participant conversations and `bot_id` on every row from day one (v1 runs one user, one bot)
-- [ ] Move a pre-pivot `teams.db` aside on first open instead of migrating it
-- [ ] Retire the `project` and `epic` commands, pipeline config validation, and role prompts; reuse the YAML validation pattern for `bot.yaml`
-- [ ] Rework `task` and `status` onto the new schema (a task is a thread with an owner and a status)
-- [ ] State under `state_root()/teams/` with `bots/` and `artifacts/` (no `worktrees/`); user settings in `~/.myai/teams.json`; no absolute client paths in state
-- [ ] Rework `tests/test_teams.py`: keep DB, migration, editor, and CLI-capture tests; drop epic and pipeline tests
-- [ ] README and CHANGELOG describe the reworked `teams` surface instead of the board
+- [x] Merge `agentic-teams` into `main`; resolve `CHANGELOG`, `cli.py`, `paths.py`, and `ROADMAP` conflicts, keeping these roadmap phases
+- [x] Keep: SQLite layer (`busy_timeout` before WAL, transactional migrations), `teams_*` path helpers, `$EDITOR` round-trip, the `teams` command group, PyYAML
+- [x] Replace the pipeline schema with a fresh `001`: `principals`, `contacts`, `conversations`, `participants`, `messages`, `message_recipients`, `tasks`, `mailbox`, `sessions`, `turns`, `events`
+- [x] N-participant conversations and `bot_id` on every row from day one (v1 runs one user, one bot)
+- [x] Move a pre-pivot `teams.db` aside on first open instead of migrating it
+- [x] Retire the `project` and `epic` commands, pipeline config validation, and role prompts; reuse the YAML validation pattern for `bot.yaml`
+- [x] Rework `task` and `status` onto the new schema (a task is a thread with an owner and a status)
+- [x] Bot home dir: `bot.yaml`, `persona.md`, `constraints.md`, `playbooks/`, `workspace/`; `teams bot new|edit|list`
+- [x] One message write path: sender must be a member, recipients must be members, a bot may only address its contacts
+- [x] Addressed bots get a mailbox item with priority by kind (user, job event, bot message, schedule)
+- [x] Every store change appends to `events` in the same transaction; `turns` and `events` reject update and delete
+- [x] Task edits carry a version so a stale `$EDITOR` session cannot clobber a newer change; a rejected edit keeps its file
+- [x] State under `state_root()/teams/` with `bots/` and `artifacts/` (no `worktrees/`); no absolute client paths in state
+- [x] Rework `tests/test_teams.py`: keep DB, migration, editor, and CLI-capture tests; drop epic and pipeline tests
+- [x] README and CHANGELOG describe the reworked `teams` surface instead of the board
 
 ### Phase 14: Agentic teams — daemon, protocol, and one bot
 
@@ -189,9 +194,8 @@ Foundation for long-lived bots: a daemon, a client protocol, and the owned agent
 - [ ] `teams daemon start|stop|status`: detached process; single instance via `flock`; epoch per start
 - [ ] Client protocol: JSON over HTTP on a unix socket; SSE event stream with `Last-Event-ID` replay
 - [ ] Exactly-once state changes: mailbox item consumed and its effects committed in one transaction
-- [ ] Bot home dir: `bot.yaml`, `persona.md`, `constraints.md`, `playbooks/`; `teams bot new|edit|list`
 - [ ] Provider clients: OpenAI-compatible (OpenAI, OpenRouter, llama.cpp) and native Anthropic; API keys daemon-side only
-- [ ] Route config per role (single entry in v1); per-bot model, effort/thinking, and sampling settings
+- [ ] Route config per role (single entry in v1); per-bot model, effort/thinking, and sampling settings; user-level defaults in `~/.myai/teams.json`
 - [ ] Owned agent loop running daemon-side; every turn boundary persisted before the next model call
 - [ ] Environment boundary interface (exec, files, git) with the plain-directory implementation; no tool bypasses it
 - [ ] Policy checkpoint on every side-effecting tool call (v1: allow + log); `policy_decisions` recorded

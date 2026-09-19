@@ -68,17 +68,17 @@ def teams_db_path() -> Path:
     return teams_root() / "teams.db"
 
 
-def teams_transcripts_dir() -> Path:
-    return teams_root() / "transcripts"
-
-
-def teams_worktrees_dir() -> Path:
-    return teams_root() / "worktrees"
-
-
 def teams_daemon_lock_path() -> Path:
     return teams_root() / "daemon.lock"
 
 
-def teams_prompts_dir() -> Path:
-    return teams_root() / "prompts"
+def teams_bots_dir() -> Path:
+    return teams_root() / "bots"
+
+
+def teams_bot_home(bot_id: str) -> Path:
+    return teams_bots_dir() / bot_id
+
+
+def teams_artifacts_dir() -> Path:
+    return teams_root() / "artifacts"

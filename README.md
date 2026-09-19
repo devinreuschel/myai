@@ -105,17 +105,20 @@ uv run python -m myai --help
 uv run python -m unittest discover -s tests
 ```
 
-## Agentic teams (board)
+## Agentic teams
 
-SQLite project/epic/task board under XDG state (`$MYAI_HOME` or `~/.local/share/myai`). View and edit without a daemon; execution comes later. Design: [docs/agentic-teams-design.md](docs/agentic-teams-design.md).
+Long-lived bots that keep an identity, remember their work, and message each other. So far this is the state layer only: the SQLite store, bot homes, and task threads under XDG state (`$MYAI_HOME` or `~/.local/share/myai`). Nothing runs until the daemon lands. Design: [docs/agentic-teams-design.md](docs/agentic-teams-design.md).
 
 ```bash
-myai teams init --name demo
-myai teams project edit
-myai teams epic add --title "…" --goal "…"
-myai teams task add --title "…" [--epic E-1]
+myai teams init                                  # create the DB and register you
+myai teams bot new "Dev Lead" --job "drives development slices"
+myai teams bot edit                              # bot.yaml in $EDITOR
+myai teams task add --title "…" [--body "…"]     # opens a thread in your DM with the bot
+myai teams task edit T-1                         # status, owner, handoff note
 myai teams status
 ```
+
+Each bot gets a home at `teams/bots/<id>/` holding `bot.yaml`, `persona.md`, `constraints.md`, `playbooks/`, and its `workspace/`.
 
 ## Sandbox (pi in a micro-VM)
 
