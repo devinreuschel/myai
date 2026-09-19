@@ -50,6 +50,16 @@ def global_config_path() -> Path:
     return global_myai_dir() / "config.json"
 
 
+def global_sync_config_path() -> Path:
+    """Selection for user-home agent sync (~/.claude, ~/.cursor, ~/.pi/agent)."""
+    return global_myai_dir() / "global.json"
+
+
+def global_sync_state_path() -> Path:
+    """Tracked hashes for global home sync prune."""
+    return state_root() / "global-state.json"
+
+
 def teams_root() -> Path:
     return state_root() / "teams"
 

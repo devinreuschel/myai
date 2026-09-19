@@ -295,8 +295,11 @@ def build_plan(
 
 def copy_skill_dir(src: Path, dst: Path) -> None:
     """Copy a skill directory tree, replacing any existing destination."""
-    if dst.exists():
+    if dst.is_symlink() or dst.is_file():
+        dst.unlink()  # rmtree refuses symlinks; never delete through one
+    elif dst.exists():
         shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dst)
 
 

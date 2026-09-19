@@ -1,41 +1,18 @@
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from myai.agentsync.master import expand_csv_list
+from myai.agentsync.config import AGENTS, ConfigError
 from myai.global_config import get_inject_myai_rule_default
+from myai.paths import global_sync_config_path, global_sync_state_path
 
 CONFIG_VERSION = 1
-MYAI_DIR = ".myai"
-CONFIG_FILE = "config.json"
-STATE_FILE = "state.json"
-
-AGENTS = ("cursor", "claude", "pi")
-
-
-class ConfigError(Exception):
-    pass
-
-
-def normalize_agents(values: list[str] | None) -> list[str]:
-    """Expand CSV agent flags; omit/empty/'all' → all agents."""
-    if not values:
-        return list(AGENTS)
-    names = expand_csv_list(values)
-    if not names or "all" in names:
-        return list(AGENTS)
-    for name in names:
-        if name not in AGENTS:
-            raise ConfigError(f"unknown agent {name!r}, expected one of {AGENTS}")
-    return names
 
 
 @dataclass
-class RepoConfig:
-    """Per-repo agentsync config stored in .myai/config.json."""
+class GlobalSyncConfig:
+    """User-home agentsync selection stored in ~/.myai/global.json."""
 
     version: int = CONFIG_VERSION
-    managed: bool = True
     agents: list[str] = field(default_factory=lambda: list(AGENTS))
     rules: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
@@ -50,34 +27,27 @@ class RepoConfig:
 
 
 @dataclass
-class RepoState:
+class GlobalSyncState:
+    """Tracked files/blocks for global home prune. Keys are agent:relpath."""
+
     files: dict[str, str] = field(default_factory=dict)
     blocks: dict[str, bool] = field(default_factory=dict)
 
 
-def myai_dir(repo: Path) -> Path:
-    return repo / MYAI_DIR
+def config_exists() -> bool:
+    return global_sync_config_path().is_file()
 
 
-def config_path(repo: Path) -> Path:
-    return myai_dir(repo) / CONFIG_FILE
-
-
-def state_path(repo: Path) -> Path:
-    return myai_dir(repo) / STATE_FILE
-
-
-def load_config(repo: Path) -> RepoConfig:
-    path = config_path(repo)
+def load_global_sync_config() -> GlobalSyncConfig:
+    path = global_sync_config_path()
     if not path.is_file():
-        raise ConfigError(f"no config at {path}; run myai init")
+        raise ConfigError(f"no global sync config at {path}; run myai global init")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid config at {path}: {exc}") from exc
-    cfg = RepoConfig(
+    cfg = GlobalSyncConfig(
         version=data.get("version", CONFIG_VERSION),
-        managed=data.get("managed", True),
         agents=list(data.get("agents", list(AGENTS))),
         rules=list(data.get("rules", [])),
         skills=list(data.get("skills", [])),
@@ -89,20 +59,12 @@ def load_config(repo: Path) -> RepoConfig:
     return cfg
 
 
-def resolve_inject_myai_rule(cfg: RepoConfig) -> bool:
-    """Per-repo override if set, else global default from ~/.myai/config.json."""
-    if cfg.inject_myai_rule is not None:
-        return cfg.inject_myai_rule
-    return get_inject_myai_rule_default()
-
-
-def save_config(repo: Path, cfg: RepoConfig) -> None:
+def save_global_sync_config(cfg: GlobalSyncConfig) -> None:
     cfg.validate()
-    path = config_path(repo)
+    path = global_sync_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "version": cfg.version,
-        "managed": cfg.managed,
         "agents": cfg.agents,
         "rules": cfg.rules,
         "skills": cfg.skills,
@@ -114,22 +76,39 @@ def save_config(repo: Path, cfg: RepoConfig) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def load_state(repo: Path) -> RepoState:
-    path = state_path(repo)
+def resolve_global_inject_myai_rule(cfg: GlobalSyncConfig) -> bool:
+    if cfg.inject_myai_rule is not None:
+        return cfg.inject_myai_rule
+    return get_inject_myai_rule_default()
+
+
+def load_global_sync_state() -> GlobalSyncState:
+    path = global_sync_state_path()
     if not path.is_file():
-        return RepoState()
+        return GlobalSyncState()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid state at {path}: {exc}") from exc
-    return RepoState(
+    return GlobalSyncState(
         files=dict(data.get("files", {})),
         blocks=dict(data.get("blocks", {})),
     )
 
 
-def save_state(repo: Path, state: RepoState) -> None:
-    path = state_path(repo)
+def save_global_sync_state(state: GlobalSyncState) -> None:
+    path = global_sync_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {"files": state.files, "blocks": state.blocks}
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def state_key(agent: str, rel: str) -> str:
+    return f"{agent}:{rel}"
+
+
+def parse_state_key(key: str) -> tuple[str, str]:
+    agent, _, rel = key.partition(":")
+    if not agent or not rel:
+        raise ConfigError(f"invalid global state key {key!r}")
+    return agent, rel

@@ -5,6 +5,7 @@ from myai.commands import (
     build,
     check,
     config,
+    global_cmd,
     init_agent,
     master,
     sandbox,
@@ -25,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     check.register(subparsers)
     build.register(subparsers)
     config.register(subparsers)
+    global_cmd.register(subparsers)
     init_agent.register(subparsers)
     master.register(subparsers)
     sync.register(subparsers)
