@@ -44,6 +44,8 @@ default that lets the user just talk to a bot and have it go.
 - **Bring your own cloud.** The daemon runs on the user's box. Every client is only an
   interface; closing one never stops a bot.
 - **Power-user transparency with hands-off defaults.**
+- **TUI-first.** The whole workflow is first-class in the TUI. The CLI is for scripting
+  and as a fallback; it never does something the TUI cannot.
 
 ### Non-goals (v1)
 
@@ -154,6 +156,11 @@ writer makes exactly-once simpler.
 A client is a stateless view over the append-only `events` log plus a cursor
 (`Last-Event-ID`). A laptop that slept eight hours reconnects and replays from its cursor.
 Any number of clients may attach at once.
+
+Every capability is a protocol operation before it is anything else. Operations are
+declared once, in a table that both the CLI subcommands and the TUI command palette are
+generated from. Nothing can then exist in the CLI that the TUI cannot reach, and a new
+operation is usable from the TUI the day it lands, before it has a screen of its own.
 
 State changes stay exactly-once, as before: consuming a mailbox item and committing its
 effects are one transaction, and a resolved approval is applied under an `applied_at`
@@ -644,25 +651,38 @@ and save the host in `~/.myai/teams.json`. Upgrading is re-running it.
 socket. No open ports, no new authentication surface, nothing beyond the standard
 library.
 
-**Clients.** The TUI comes first. A web client (desktop, browser, mobile from one stack)
-and a chat bridge are later clients of the same protocol, not new architectures. A
-bridge maps a conversation onto a chat app the user already has, which brings mobile and
-push notifications; inspection (manifests, diffs, policy) stays in our own clients.
+**The TUI is the product surface.** Everything a user does is first-class there: first
+run and creating a bot, chat, bots and their homes, tasks and the board, the inbox, jobs
+and their live streams, the memory browser, context manifests and survival records,
+presets and policy, routes and their health, and connecting to a remote box. Frequent
+flows get screens and hotkeys; the command palette (§2.2) reaches everything else, and a
+help overlay lists every binding. Structured settings are forms; long-form text
+(persona, constraints, playbooks, a handoff note) suspends to `$EDITOR` and returns.
+
+**The CLI is the fallback and the scripting surface:** daemon control, bootstrap, and
+the same operations for pipes, cron, and a machine with no usable terminal UI. It may
+expose less than the TUI, never more.
 
 ```
+myai teams                            # opens the TUI
 myai teams daemon start|stop|status
-myai teams tui
-myai teams bot new|edit|list          # $EDITOR round-trip on the bot's home
-myai teams send <bot> "message"       # scripting; same path as the TUI
+myai teams bot new|edit|list          # fallback for what the TUI does
+myai teams send <bot> "message"       # scripting; same operation as the TUI
 myai teams inbox | approve | reject
 myai cloud bootstrap user@host
 ```
+
+A web client (desktop, browser, mobile from one stack) and a chat bridge are later
+clients of the same protocol, not new architectures. A bridge maps a conversation onto a
+chat app the user already has, which brings mobile and push notifications; inspection
+(manifests, diffs, policy) stays in our own clients.
 
 **v1 seam:** the daemon/client split and the protocol exist from day one, even on one
 machine; state is relocatable; no laptop paths in state.
 **Open:** Python 3.14 on stock VPS images (a uv-managed interpreter is the likely
 answer), backups of the state directory, notifying the user when every client is
-closed (the bridge), and which bridge first.
+closed (the bridge), which bridge first, and the TUI toolkit (Textual was the earlier
+intent; it would be the project's second dependency).
 
 ## 11. Data model (sketch)
 
@@ -784,7 +804,8 @@ Large artifacts (tool outputs, transfers) stay on disk with paths in the databas
    OpenRouter. The episodic log, resumable sessions, rollover, mining with event-time
    reconcile, the context manifest and survival records. Tasks and handoff notes.
    `self` sub-bot jobs and the Cursor connector. Bot-owned workspaces and `transfer`.
-   The inbox with the always-gated classes. A TUI client. In practice: a long-lived dev
+   The inbox with the always-gated classes. A TUI that covers all of it, from first run
+   to reading a reply's context manifest, with the CLI as fallback. In practice: a long-lived dev
    lead that remembers the project and drives Cursor slices. M1 also builds every "v1
    seam" named above.
    **Proof:** a replay harness that teaches something in episode 1 and probes for it in

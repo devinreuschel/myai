@@ -202,8 +202,16 @@ Foundation for long-lived bots: a daemon, a client protocol, and the owned agent
 - [ ] Wake lifecycle: mailbox priority (user, job event, bot message, schedule); one wake at a time; mid-wake messages queue
 - [ ] Wake turn budget with a delegate-or-wrap-up nudge
 - [ ] Context assembly: stable prefix, semi-stable block, volatile tail; append-only within a session
-- [ ] TUI client: DM with one bot, queued-message indicator, reconnect and replay
-- [ ] `teams send`, `teams inbox`, `teams approve|reject` for scripting
+- [ ] Operation table: every capability declared once; CLI subcommands and the TUI command palette generated from it
+- [ ] Parity check in tests: no operation reachable from the CLI but not the TUI
+- [ ] TUI toolkit decision (Textual was the earlier intent)
+- [ ] `myai teams` opens the TUI: conversation sidebar, chat pane, status bar, command palette, help overlay of every binding
+- [ ] TUI first run: register the user and create the first bot without touching the CLI; start the local daemon if it is not running
+- [ ] TUI chat: DM with a bot, streamed replies, queued-message indicator, reconnect and replay
+- [ ] TUI bot screen: create, list, edit settings as a form; persona, constraints, and playbooks suspend to `$EDITOR`
+- [ ] TUI tasks and board: list by status and owner, open a task's thread, edit status, owner, and handoff
+- [ ] TUI inbox: approve or reject with a note; gates also resolvable inline in the chat
+- [ ] CLI as fallback and scripting surface: `teams send`, `teams inbox`, `teams approve|reject`, alongside the existing `bot` and `task` commands
 
 ### Phase 15: Agentic teams — memory
 
@@ -227,6 +235,9 @@ Long-lived without getting stupid: mined facts, not repeated summaries.
 - [ ] Budgeted `constraints.md` with forced merge/demote when full
 - [ ] Block presets (`hands-off`, `supervised`, `locked-down`) over `auto|notify|gate`; per-bot overrides
 - [ ] Display toggle for manifests, mining diffs, and survival records; capture always on
+- [ ] TUI: open any reply's context manifest with a hotkey; survival records and rollover markers in the chat
+- [ ] TUI memory browser: search facts, open a topic, jump to the source turn, edit or revert a fact
+- [ ] TUI review of debrief proposals as diffs; preset and per-bot policy editor
 - [ ] Optional local llama.cpp route for mining (user setting)
 - [ ] Replay harness: teach in episode 1, probe in episode N across rollovers and mining; manifest-level assertions
 
@@ -246,6 +257,8 @@ A bot stays free; long work runs in sub-bots or Cursor cloud agents.
 - [ ] Repo `AGENTS.md` loaded as project-scoped constraints when working in that repo
 - [ ] `transfer` tool: client pushes, always gated, exact paths and sizes shown, secret-looking paths refused, waits in the inbox with no client attached
 - [ ] Artifact delivery from bot to user (`notify`)
+- [ ] TUI jobs panel: live list, a sub-bot's or Cursor worker's stream, steer and cancel hotkeys, per-run usage
+- [ ] TUI transfer approval showing exact paths and sizes; the TUI performs the push
 - [ ] Always-gated classes enforced from v1: irreversible external actions and `transfer`
 
 ### Phase 17: Agentic teams — multi-bot and teams
@@ -263,6 +276,7 @@ Slack-shaped: DMs, groups, owned tasks, shared knowledge.
 - [ ] Policy rules: deny / require-approval on tool calls, with teaching denial messages
 - [ ] Action-triggered constraint injection keyed on the pending call
 - [ ] Mined constraints routed to policy rule, system prompt, or trigger
+- [ ] TUI: create group chats, edit a bot's contacts, team roster, task assignment
 
 ### Phase 18: Agentic teams — isolation tiers
 
@@ -276,6 +290,7 @@ Each bot gets its own environment, connectors, and egress.
 - [ ] Hydrate on wake, tear down on idle; workspace persisted outside the environment
 - [ ] MCP server placement decided (daemon-side proxy vs in-environment)
 - [ ] Reduced-permission sub-bots (authority only narrows downward)
+- [ ] TUI: each bot's environment tier, egress allowlist, and connectors, viewable and editable
 
 ### Phase 19: Agentic teams — BYO cloud and model routes
 
@@ -292,6 +307,7 @@ Close the laptop; the bots keep working on your own box.
 - [ ] Endpoint capability declarations (tool calling, context length)
 - [ ] State directory backup and restore
 - [ ] Re-run bootstrap as the upgrade path; uninstall
+- [ ] TUI: bootstrap a box, pick and connect to a host, route health per bot, local-model forwarding indicator
 
 ### Phase 20: Agentic teams — more clients
 
