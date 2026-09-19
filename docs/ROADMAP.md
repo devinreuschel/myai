@@ -167,116 +167,141 @@ Make myai a clean backend for agentic tools and remote use.
 - [ ] Docs + recipes: "use myai as your OpenAI base URL" for the common agentic tools
 - [ ] Stretch: tunnel/share helper for exposing the local endpoint to another machine
 
-### Phase 13: Agentic teams — skeleton
+### Phase 13: Agentic teams — merge and rework the skeleton
 
-Project/epic/task board over SQLite. Design: [docs/agentic-teams-design.md](agentic-teams-design.md). No daemon yet.
+Step one. The unmerged `agentic-teams` branch holds a board skeleton for the superseded pipeline design; land it and reshape it. Design: [docs/agentic-teams-design.md](agentic-teams-design.md). Phases 13–16 together are v1.
 
-- [ ] XDG paths: `teams.db`, transcripts dir, worktrees parent, `daemon.lock` under state root
-- [ ] SQLite WAL + `busy_timeout`; schema + migrations for `projects`, `epics`, `tasks`, `runs`, `events`, `approvals`, `messages`
-- [ ] Unique open-approval indexes (at most one unresolved approval per task and per epic)
-- [ ] `myai teams init`: create DB and register first project
-- [ ] Project config as data: roster, pipeline stages/roles/gates, concurrency ceilings, budgets, standups, notifications, `epic_checks`
-- [ ] Default concurrency when omitted: per-stage 1, `max_total` unset, `pm: 1`
-- [ ] `teams project new|edit|list` (YAML edit → stored `config_json`)
-- [ ] Default role prompt files referenced by roster (`prompts/pm.md`, designer, developer, qa, …)
-- [ ] Epic statuses: `grooming|awaiting_approval|executing|awaiting_review|done|abandoned`
-- [ ] Task statuses: `draft|backlog|ready|running|waiting_human|blocked|done|failed`; `blocked_by`, priority, stage, role, version, loop_count
-- [ ] `teams epic list|show|approve|abandon` (E-<id>)
-- [ ] `teams task add|edit|list|show` (T-<id>); `$EDITOR` markdown/YAML round-trip bumps `version`
-- [ ] Standalone tasks (no epic) supported alongside epic-linked tasks
-- [ ] `teams status [PROJECT]`: board overview, in-flight and queued-by-stage counts
-- [ ] CLI usable with daemon down (view/edit/queue only; no execution)
+- [ ] Merge `agentic-teams` into `main`; resolve `CHANGELOG`, `cli.py`, `paths.py`, and `ROADMAP` conflicts, keeping these roadmap phases
+- [ ] Keep: SQLite layer (`busy_timeout` before WAL, transactional migrations), `teams_*` path helpers, `$EDITOR` round-trip, the `teams` command group, PyYAML
+- [ ] Replace the pipeline schema with a fresh `001`: `principals`, `contacts`, `conversations`, `participants`, `messages`, `message_recipients`, `tasks`, `mailbox`, `sessions`, `turns`, `events`
+- [ ] N-participant conversations and `bot_id` on every row from day one (v1 runs one user, one bot)
+- [ ] Move a pre-pivot `teams.db` aside on first open instead of migrating it
+- [ ] Retire the `project` and `epic` commands, pipeline config validation, and role prompts; reuse the YAML validation pattern for `bot.yaml`
+- [ ] Rework `task` and `status` onto the new schema (a task is a thread with an owner and a status)
+- [ ] State under `state_root()/teams/` with `bots/` and `artifacts/` (no `worktrees/`); user settings in `~/.myai/teams.json`; no absolute client paths in state
+- [ ] Rework `tests/test_teams.py`: keep DB, migration, editor, and CLI-capture tests; drop epic and pipeline tests
+- [ ] README and CHANGELOG describe the reworked `teams` surface instead of the board
 
-### Phase 14: Agentic teams — concurrent Cursor runs
+### Phase 14: Agentic teams — daemon, protocol, and one bot
 
-Daemon orchestrates parallel isolated Cursor CLI agents on a develop-only pipeline.
+Foundation for long-lived bots: a daemon, a client protocol, and the owned agent loop.
 
-- [ ] `teams daemon start|stop|status`: detached process; single instance via advisory `flock` on `daemon.lock`
-- [ ] Daemon epoch (uuid) in lockfile; stamped on every launched `runs` row
-- [ ] SQLite-as-IPC: CLI writes rows; daemon polls (~1–2s); no socket protocol
-- [ ] Exactly-once transitions: message/`processed_at`, approval/`applied_at`, run outcome + task transition each in one txn
-- [ ] Agents never write task state; DB lives outside agent workspaces
-- [ ] Orchestrator owns prompt composition; adapters receive fully composed prompts only
-- [ ] `AgentBackend` protocol + `RunResult` (outcome/summary/details/`needs_human`/transcript)
-- [ ] Structured agent output: fenced JSON result block + `<needs_human>` sentinel; unparseable → `error` + inbox
-- [ ] Cursor CLI adapter spike: resume flags, non-interactive/yolo flags, `--workspace` vs CWD, `--model`, multi-agent worktree conflict
-- [ ] Cursor CLI adapter: resolve `agent`/`cursor-agent`; `agent -p --output-format json`; wall-clock timeout; tee transcript
-- [ ] Spawn each run in its own process group (`setsid`); record `pid`/`pgid`/`proc_start` on `runs`
-- [ ] `daemon stop` group-kills every live run; worktrees left in place
-- [ ] Scheduler: count in-flight by stage; dispatch only real ready work; never invent tasks to fill slots
-- [ ] Honor `concurrency.per_stage` and optional `max_total` as ceilings; claim order: DB `runs`+`running` txn, then worktree, then spawn
-- [ ] Candidate order: priority desc, then older ready first; skip if open approval or over `max_runs_per_task`
-- [ ] Task-lifetime sticky branch + worktree (`teams/T-<id>` for standalone); path under `worktrees/<project>/T-<id>/`
-- [ ] Cursor always bound to task worktree, never primary `workspace_path`; require git repo for parallel agents
-- [ ] One-stage `develop` pipeline end-to-end with multiple simultaneous children without shared-tree conflicts
-- [ ] Session `resume_token` support (optimization; cold-start if unsupported)
-- [ ] `runs` / `events` recording; `teams log T-<id>` (events + transcripts)
-- [ ] Restart reconciliation: stale-epoch in-flight runs → parse transcript or mark `error`; re-queue or inbox
-- [ ] Orphan cleanup: match `(pid, proc_start)` before kill; confirm with user (`[y/N]`)
-- [ ] Sweep unmanaged worktree dirs not referenced by any live task after reconciliation
+- [ ] `teams daemon start|stop|status`: detached process; single instance via `flock`; epoch per start
+- [ ] Client protocol: JSON over HTTP on a unix socket; SSE event stream with `Last-Event-ID` replay
+- [ ] Exactly-once state changes: mailbox item consumed and its effects committed in one transaction
+- [ ] Bot home dir: `bot.yaml`, `persona.md`, `constraints.md`, `playbooks/`; `teams bot new|edit|list`
+- [ ] Provider clients: OpenAI-compatible (OpenAI, OpenRouter, llama.cpp) and native Anthropic; API keys daemon-side only
+- [ ] Route config per role (single entry in v1); per-bot model, effort/thinking, and sampling settings
+- [ ] Owned agent loop running daemon-side; every turn boundary persisted before the next model call
+- [ ] Environment boundary interface (exec, files, git) with the plain-directory implementation; no tool bypasses it
+- [ ] Policy checkpoint on every side-effecting tool call (v1: allow + log); `policy_decisions` recorded
+- [ ] Wake lifecycle: mailbox priority (user, job event, bot message, schedule); one wake at a time; mid-wake messages queue
+- [ ] Wake turn budget with a delegate-or-wrap-up nudge
+- [ ] Context assembly: stable prefix, semi-stable block, volatile tail; append-only within a session
+- [ ] TUI client: DM with one bot, queued-message indicator, reconnect and replay
+- [ ] `teams send`, `teams inbox`, `teams approve|reject` for scripting
 
-### Phase 15: Agentic teams — pipeline + epic integration
+### Phase 15: Agentic teams — memory
 
-Full per-task stage machines, gates/inbox, and one finished local epic branch.
+Long-lived without getting stupid: mined facts, not repeated summaries.
 
-- [ ] User-defined multi-stage pipeline as project data (bespoke stages without source changes)
-- [ ] Independent per-task FSM: siblings advance on their own clocks under shared stage ceilings
-- [ ] Gate policies: `auto`, `human` (always pause), `epic` (pause standalone only)
-- [ ] Agent-initiated `needs_human` and bound exhaustion (`max_loops`, `max_runs_per_task`) open the same inbox shape
-- [ ] Gated task enters `waiting_human` and frees its stage slot immediately
-- [ ] QA `on_fail` bounce to prior stage; `loop_count` increments; escalate at `max_loops`; reset past qa
-- [ ] Mid-flight edit detection: `runs.task_version` vs current → `stale` + inbox, no auto-transition
-- [ ] `teams inbox`: pending approvals + escalations (non-blocking; no terminal `[y/n]`)
-- [ ] `teams approve|reject` with `-m` note routed back as feedback; apply only resolved-unapplied rows
-- [ ] Epic branch cut at scope approval: `teams/E-<id>` from `base_branch`
-- [ ] Task branches `teams/E-<n>/T-<m>`; sticky across stages on one task-lifetime worktree
-- [ ] All daemon git integration in a daemon-owned epic worktree; never merge in the human's primary checkout
-- [ ] Rebase task onto epic tip before final verifying stage (qa); rebase conflict counts as QA fail bounce
-- [ ] Promote: merge task → epic (serialized, idempotent); promote conflict → bounce to develop
-- [ ] Failed/stale/error runs never promote; worktree retained for retry
-- [ ] Optional `epic_checks` command on epic branch (default: at epic completion only)
-- [ ] When all tasks `done`: park epic `awaiting_review` with finished local branch; never push or open PRs
-- [ ] `teams epic approve` marks epic `done` and prunes task branches; review notes short of accept → new tasks on same branch
-- [ ] Deliverables live in task worktree then promote with the branch; downstream stages read them as repo files
-- [ ] Worktree remove on task `done`/abandon; task branches persist until epic merge/prune policy
+- [ ] Episodic log: immutable `turns` with harness-set `origin` (`first_hand`|`recalled`) and `event_time`
+- [ ] Sessions resumable from the last durable turn boundary; interrupted tool calls flagged on resume
+- [ ] Context-full strategy interface; `rollover` implementation (handoff note, mine, fresh session)
+- [ ] Survival records for every rollover; rollover markers in the chat
+- [ ] Tasks with per-task handoff notes pushed at the next wake
+- [ ] Librarian: post-session mining into self-contained, scoped facts with source turns and how-known
+- [ ] Provenance rules enforced: first-hand grounding only; recalled spans readable but never a source; bot messages never a source
+- [ ] Reconcile by event time: add / supersede / expire / no-op; serialized per scope; idempotent re-mining
+- [ ] `facts` + FTS5; `scope` column (private only in v1); `mined_by` model recorded
+- [ ] User edits and reverts of facts recorded as events so a rebuild replays them
+- [ ] Retrieval pushed at wake: verbatim conversation tail + search keyed on the incoming message, with age and how-known inline
+- [ ] Pull tools: `memory.search`, `memory.open`, `memory.source`, `history.search`, `history.read` (own conversations only)
+- [ ] Hierarchical memory index in the prefix (topics, facts, sources)
+- [ ] Context manifest per reply (turns, facts, playbooks, handoff, constraints, model, route, tokens)
+- [ ] Debrief proposals: playbook edits and constraint promotions, applied or queued per preset
+- [ ] Budgeted `constraints.md` with forced merge/demote when full
+- [ ] Block presets (`hands-off`, `supervised`, `locked-down`) over `auto|notify|gate`; per-bot overrides
+- [ ] Display toggle for manifests, mining diffs, and survival records; capture always on
+- [ ] Optional local llama.cpp route for mining (user setting)
+- [ ] Replay harness: teach in episode 1, probe in episode N across rollovers and mining; manifest-level assertions
 
-### Phase 16: Agentic teams — PM layer
+### Phase 16: Agentic teams — jobs, workers, and workspaces
 
-Human talks to the PM; agents execute. Grooming, chat, plan revisions, standups.
+A bot stays free; long work runs in sub-bots or Cursor cloud agents.
 
-- [ ] Daemon poll: unprocessed `messages` → PM; resolved approvals → apply transitions; then dispatch; then standups
-- [ ] Stateless PM: every invocation cold from project config, board, events, open approvals, message thread
-- [ ] Dedicated `concurrency.pm` budget so PM work does not starve task workers (default 1)
-- [ ] Read-only PM asks may use primary `workspace_path`; mutating PM paths take a worktree
-- [ ] `teams ask`: one-shot read-only → `from_pm` reply; no task mutation
-- [ ] `teams tell`: new goal → epic grooming; correction → gated `plan_revision` (v1: explicit flags/phrasing)
-- [ ] `teams chat [PROJECT]`: interactive PM session; approve drafted revisions/scope inline
-- [ ] Epic intake: create epic in `grooming`; dedicated `groom_prompt` planning persona
-- [ ] Conversational groom loop: epic-threaded `messages`, live `draft` tasks, human `$EDITOR` mid-groom
-- [ ] PM may explore repo between turns ("look into that and get back"); transcript + findings resume across sittings
-- [ ] Question batches as `approvals` kind `question`; answers via inbox or chat
-- [ ] Finalize via PM judgment or human "go with what you have" (state remaining assumptions)
-- [ ] `epic_approval`: refined goal, task list + deps, assumptions; approve → drafts → backlog/ready, cut epic branch
-- [ ] Reject scope → back to grooming with note
-- [ ] Ungated in-epic grooming after approval (split/add/reorder/edit); goal/scope changes need fresh `epic_approval`
-- [ ] Plan revision: structured task-patch in `payload_json` + free-form summary; daemon applies patch only after human approve
-- [ ] Rejection of plan/stage gates routes feedback to PM as re-plan trigger
-- [ ] PM-composed epic handoff summary (PR-description-ready) at `awaiting_review`
-- [ ] Rolling grooming-notes summary on epic to bound prompt context (drop old turns)
-- [ ] `teams standup [--now | --schedule]`: PM digest of events since last standup
-- [ ] Standup delivery v1: terminal nudge on next CLI use + digest file
-- [ ] Notification adapter interface (inbox + standups) so later channels plug in without scheduler changes
+- [ ] Executor seam: `spawn`, `status`, `steer`, `cancel`, `result`; job events into the owner's mailbox
+- [ ] `self` executor: sub-bot on the owned loop with a context package; depth 1; reports only to the parent; `done|failed|needs_input`
+- [ ] Sub-bot gets its own workspace directory; one `self` job per bot at a time
+- [ ] Sub-bot transcripts mined into the parent's memory
+- [ ] Open-jobs summary in every parent wake; steer or cancel decided by the bot from message content
+- [ ] Cursor connector: create agent, follow-up, cancel, SSE stream, usage; completion by stream or poll; key daemon-side
+- [ ] Reattach to external jobs by `external_ref` after a daemon restart
+- [ ] Bot-owned clones under its workspace; delivery by branches and PRs; never the user's checkout, local included
+- [ ] Forge credential held daemon-side for pushes
+- [ ] Repo `AGENTS.md` loaded as project-scoped constraints when working in that repo
+- [ ] `transfer` tool: client pushes, always gated, exact paths and sizes shown, secret-looking paths refused, waits in the inbox with no client attached
+- [ ] Artifact delivery from bot to user (`notify`)
+- [ ] Always-gated classes enforced from v1: irreversible external actions and `transfer`
 
-### Phase 17: Agentic teams — polish & second backend
+### Phase 17: Agentic teams — multi-bot and teams
 
-- [ ] Claude Code CLI adapter (`claude -p`, stream-json, `--resume`) behind the same contract
-- [ ] Local llamacpp agent harness milestone (tool-calling loop) — stub/contract only until ready
-- [ ] Webhook notification adapter
-- [ ] Matrix notification adapter
-- [ ] TUI exploration (Textual) over the same DB
-- [ ] Export/import groundwork for external task systems (Jira, etc.)
-- [ ] Optional `claimed_at` lease to avoid re-running interrupted PM/backend work after crash
-- [ ] Auto-detect free-form tell as goal vs correction (today: explicit flags)
-- [ ] Detect PM tasks outside approved epic goal (today: epic branch review is the backstop)
-- [ ] Launchd / systemd user unit for `teams daemon`
-- [ ] Model routing semantics per role via roster `model_hint` (cheap QA vs strong design)
+Slack-shaped: DMs, groups, owned tasks, shared knowledge.
+
+- [ ] Multiple bots; bot-to-bot DMs; user-created group chats
+- [ ] Addressed wakes: membership = visibility, recipients = wake
+- [ ] Contacts enforced as an ACL on every send
+- [ ] Task assignment with the `assign` permission; board view over tasks
+- [ ] Team: roster, shared-memory scope, policy defaults; default template with a lead
+- [ ] Lead as default recipient for unaddressed group messages; no lead wakes all members
+- [ ] Team-shared memory: gated promotion from private; write-to-shared as a per-bot permission
+- [ ] Schedules and external triggers as wake sources
+- [ ] Policy rules: deny / require-approval on tool calls, with teaching denial messages
+- [ ] Action-triggered constraint injection keyed on the pending call
+- [ ] Mined constraints routed to policy rule, system prompt, or trigger
+
+### Phase 18: Agentic teams — isolation tiers
+
+Each bot gets its own environment, connectors, and egress.
+
+- [ ] Research: viable isolation tier on VPSes without `/dev/kvm`; Node/QEMU footprint on the box
+- [ ] Gondolin microVM environment via `myai/sandbox` (non-interactive exec, per-bot VM spec)
+- [ ] Container environment tier
+- [ ] Per-bot egress allowlist and connector set enforced by the environment
+- [ ] Credentials applied at the boundary; never in environment files or process env
+- [ ] Hydrate on wake, tear down on idle; workspace persisted outside the environment
+- [ ] MCP server placement decided (daemon-side proxy vs in-environment)
+- [ ] Reduced-permission sub-bots (authority only narrows downward)
+
+### Phase 19: Agentic teams — BYO cloud and model routes
+
+Close the laptop; the bots keep working on your own box.
+
+- [ ] `myai cloud bootstrap user@host`: run `install.sh` over SSH, systemd user unit, `enable-linger`, health check, save host
+- [ ] Interpreter strategy for stock VPS images (Python 3.14)
+- [ ] Client transport: `ssh` subprocess forwarding the daemon socket; no open ports
+- [ ] Multiple clients attached at once; reconnect with cursor replay across sleeps
+- [ ] Route engine: ordered endpoints, health checks, `on_unavailable: fallback|wait|fail`
+- [ ] Fallback opt-in per bot; config-time warning for local-only always-on roles; route health in bot status
+- [ ] Park and resume wakes on route loss; deferred mining queue when the miner route is down
+- [ ] Reverse-forward a client's `llama-server` to the box; last hop via the `model.host` loopback route
+- [ ] Endpoint capability declarations (tool calling, context length)
+- [ ] State directory backup and restore
+- [ ] Re-run bootstrap as the upgrade path; uninstall
+
+### Phase 20: Agentic teams — more clients
+
+Same protocol, more surfaces.
+
+- [ ] Chat bridge client (conversation mapped onto an external chat app) with push notifications
+- [ ] Inbox items and gates resolvable from the bridge
+- [ ] Web client on the same protocol (desktop, browser, mobile)
+
+### Phase 21: Agentic teams — later options
+
+- [ ] Vector search behind the same retrieval interface, once FTS recall demonstrably fails
+- [ ] `compact` context-full strategy emitting the same survival record
+- [ ] Claude Code binary as an executor (unmodified binary, the user's own login)
+- [ ] pi as an executor, run through the existing `myai sandbox`
+- [ ] Explicit in-session `remember` tool, if the miner alone proves insufficient
+- [ ] Cost controls: mailbox throttling and budgets from captured usage
