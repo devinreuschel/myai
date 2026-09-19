@@ -6,19 +6,21 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from myai.paths import sandbox_locks_dir
+from myai.paths import global_myai_dir, sandbox_locks_dir, state_root
 from myai.sandbox.config import (
     SandboxConfig,
     effective_rootfs_size,
     sidecar_invocation,
 )
+from myai.sandbox.agent_git import AgentGitError, import_refs, seed
+from myai.sandbox.config import SANDBOX_REF_NAMESPACE, git_commit_mode
 from myai.sandbox.doctor import doctor_ok, failure_message, run_doctor
 from myai.sandbox.provision import (
     agent_staging_dir,
     needs_provision,
-    prepare_workspace_session_link,
-    cleanup_workspace_session_link,
     read_debug_missing_exes,
+    remove_stale_workspace_link,
+    scrub_session_symlinks,
 )
 from myai.sandbox.progress import RunProgress
 from myai.sandbox.pty import run_foreground
@@ -37,6 +39,26 @@ class RunPlan:
     env: dict[str, str]
     spec_path: Path
     mode: str  # run | provision
+
+
+def check_mountable(repo: Path) -> None:
+    """Refuse to hand the guest a directory that contains myai's own state.
+
+    The trust store, the sidecar's code, and the global sandbox config all live
+    there; a guest that can write them decides how the next run behaves.
+    """
+    root = repo.resolve()
+    for label, path in (
+        ("your home directory", Path.home()),
+        ("myai's state directory", state_root()),
+        ("myai's config directory", global_myai_dir()),
+    ):
+        resolved = path.resolve()
+        if resolved == root or root in resolved.parents:
+            raise GondolinError(
+                f"refusing to sandbox {root}: it contains {label} ({resolved}). "
+                "Run the sandbox from a project directory instead."
+            )
 
 
 def secret_child_env(cfg: SandboxConfig, base: dict[str, str]) -> tuple[dict[str, str], list[str]]:
@@ -90,6 +112,13 @@ def build_run_plan(
 
     if cfg.network_policy == "allow-all" and progress:
         progress.say("warning: network_policy is 'allow-all'; the sandbox has unrestricted network egress")
+    if cfg.network_policy == "deny-all" and cfg.host_loopback.enabled and progress:
+        progress.say("note: network_policy is 'deny-all'; host loopback routes are off for this run")
+    if cfg.git_access == "write" and not cfg.mount_readonly and progress:
+        progress.say(
+            "warning: git_access is 'write'; the guest can write the real .git, and hooks "
+            "and config it leaves there run on the host"
+        )
 
     spec_path = _write_spec(vm_plan)
     cmd = [*sidecar_invocation(cfg), str(spec_path)]
@@ -129,6 +158,7 @@ def run_provision(
     if not needs_provision(cfg, force=force):
         progress.say("Sandbox already provisioned.")
         return 0
+    check_mountable(repo)
     if not skip_doctor:
         progress.say("Checking sandbox prerequisites...")
         results = run_doctor(cfg)
@@ -162,6 +192,7 @@ def run_sandbox(
     debug: bool = False,
 ) -> int:
     progress = RunProgress(quiet=quiet)
+    check_mountable(repo)
 
     if not skip_doctor:
         progress.say("Checking sandbox prerequisites...")
@@ -177,11 +208,14 @@ def run_sandbox(
 
     lock_path = _lock_path(repo)
     acquire_lock(lock_path)
-    session_link = prepare_workspace_session_link(repo, cfg)
+    remove_stale_workspace_link()
     plan: RunPlan | None = None
     try:
         if not skip_provision and needs_provision(cfg, force=reprovision):
             run_provision(repo, cfg, skip_doctor=True, quiet=quiet, force=reprovision)
+
+        if git_commit_mode(cfg):
+            _seed_agent_git(repo, cfg, progress)
 
         plan = build_run_plan(repo, cfg, pi_args, progress=progress, debug=debug)
         progress.say(f"Starting Gondolin VM ({cfg.image})...")
@@ -196,8 +230,36 @@ def run_sandbox(
     finally:
         if plan is not None:
             plan.spec_path.unlink(missing_ok=True)
-        cleanup_workspace_session_link(session_link)
+        for link in scrub_session_symlinks(repo, cfg):
+            progress.say(f"removed symlink the guest left in the session dir: {link}")
+        if git_commit_mode(cfg):
+            _import_agent_git(repo, cfg, progress)
         release_lock(lock_path)
+
+
+def _seed_agent_git(repo: Path, cfg: SandboxConfig, progress: RunProgress) -> None:
+    try:
+        if seed(repo, cfg) is not None:
+            progress.say("git: agent commits to a scratch clone; the real .git stays read-only")
+    except AgentGitError as exc:
+        # A seed failure must not sink the run; the agent just falls back to a
+        # read-only .git for this session.
+        progress.say(f"warning: could not set up the agent git scratch dir: {exc}")
+
+
+def _import_agent_git(repo: Path, cfg: SandboxConfig, progress: RunProgress) -> None:
+    try:
+        imported = import_refs(repo, cfg)
+    except AgentGitError as exc:
+        progress.say(f"warning: could not import the agent's commits: {exc}")
+        return
+    if not imported:
+        return
+    progress.say(f"git: imported the agent's work into {SANDBOX_REF_NAMESPACE}/<run>/*:")
+    for ref, sha in imported:
+        progress.say(f"  {sha}  {ref}")
+    example = imported[0][0]
+    progress.say(f"review it with:  git -C {repo} log --oneline {example}")
 
 
 def _print_debug_audit(staging: Path) -> None:

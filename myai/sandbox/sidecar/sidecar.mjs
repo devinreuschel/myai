@@ -11,9 +11,9 @@ import {
   RealFSProvider,
   ReadonlyProvider,
   ShadowProvider,
-  createShadowPathPredicate,
   createHttpHooks,
 } from '@earendil-works/gondolin'
+import { createWorkspaceGuard } from './guard.mjs'
 
 /**
  * Load and parse the VM spec JSON file path passed on argv.
@@ -37,18 +37,20 @@ function sandboxOptions (spec) {
 }
 
 /**
- * Build workspace VFS provider with optional hidden paths and RO wrapper.
+ * Build workspace VFS provider: hidden paths, write-protected .git, RO wrapper.
  * @param {Record<string, unknown>} workspace
  * @returns {import('@earendil-works/gondolin').VFSProvider}
  */
 function workspaceProvider (workspace) {
-  let provider = new RealFSProvider(workspace.hostPath)
-  const hidden = workspace.hiddenPaths ?? []
-  if (hidden.length > 0) {
-    provider = new ShadowProvider(provider, {
-      shouldShadow: createShadowPathPredicate(hidden),
-    })
-  }
+  // Always wrapped, even with nothing hidden: the guard also shields .git, and
+  // ShadowProvider has no hard-link op, which keeps protected files from being
+  // reached under a second name.
+  let provider = new ShadowProvider(new RealFSProvider(workspace.hostPath), {
+    shouldShadow: createWorkspaceGuard(workspace.hostPath, {
+      hiddenPaths: workspace.hiddenPaths ?? [],
+      gitReadonly: workspace.gitReadonly ?? true,
+    }),
+  })
   if (workspace.readonly) {
     provider = new ReadonlyProvider(provider)
   }
@@ -105,9 +107,18 @@ function buildHttpHooks (network, secrets) {
   const tcpKeys = Object.keys(network.tcpHosts ?? {})
 
   if (policy === 'allow-all') {
-    return { httpHooks: undefined, guestEnv: Object.fromEntries(
-      Object.entries(secrets).map(([k, v]) => [k, v.value])
-    ) }
+    if (!hasSecrets) {
+      return { httpHooks: undefined, guestEnv: {} }
+    }
+    // Egress stays as open as it is without hooks, but the guest still only
+    // ever holds placeholders; real values are swapped in for a secret's own
+    // hosts. Handing out raw values here would let the guest send them anywhere.
+    const { httpHooks, env } = createHttpHooks({
+      allowedHosts: ['*'],
+      blockInternalRanges: false,
+      secrets,
+    })
+    return { httpHooks, guestEnv: env ?? {} }
   }
 
   const baseOpts = {

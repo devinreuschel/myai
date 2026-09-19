@@ -9,6 +9,14 @@ from myai.agentsync.config import RepoConfig, save_config
 from myai.agentsync.registry import set_master
 from myai.agentsync.render import MYAI_MANAGED_RULE
 from myai.global_config import set_inject_myai_rule_default
+from myai.sandbox.trust import (
+    UntrustedConfigError,
+    describe_grants,
+    is_trusted,
+    load_trusted_config,
+    revoke_repo,
+    trust_repo,
+)
 from myai.sandbox.config import (
     DENY_ALL_SENTINEL,
     DEFAULT_MODEL_ENDPOINT,
@@ -23,12 +31,13 @@ from myai.sandbox.config import (
     _config_from_dict,
     _config_to_dict,
     default_sandbox_config,
+    ALPINE_MIRROR_HOST,
     effective_allow_hosts,
+    effective_hidden_paths,
     effective_rootfs_size,
     effective_workspace_path,
     gondolin_package_spec,
     sidecar_invocation,
-    host_sessions_dir,
     load_config,
     provision_allow_hosts,
     resolve_host_loopback_enabled,
@@ -38,24 +47,33 @@ from myai.sandbox.config import (
     rewrite_endpoint_for_guest,
     runtime_allow_host_args,
     save_repo_config,
+    validate_host_pattern,
 )
 from myai.sandbox.doctor import doctor_ok, run_doctor
-from myai.sandbox.gondolin import build_provision_plan, build_run_plan
+from myai.sandbox.gondolin import (
+    GondolinError,
+    build_provision_plan,
+    build_run_plan,
+    check_mountable,
+)
 from myai.sandbox.provision import (
     build_pi_launch_shell,
     build_provision_shell,
-    cleanup_workspace_session_link,
     guest_agent_env,
     is_provisioned,
     needs_provision,
     pi_bin_dir,
     pi_install_dir,
+    build_git_bundle_shell,
+    git_bundle_dir,
     prepare_agent_dir,
-    prepare_workspace_session_link,
     read_debug_missing_exes,
+    remove_stale_workspace_link,
     render_guest_settings,
     render_models_json,
+    scrub_session_symlinks,
     session_dir_name,
+    session_slot_mount,
 )
 
 
@@ -73,8 +91,25 @@ class SandboxTestCase(unittest.TestCase):
         os.environ["MYAI_HOME"] = self._tmp.name
         os.environ.pop("MYAI_HOST_LOOPBACK", None)
         os.environ.pop("MYAI_MODEL_ENDPOINT", None)
+        # building a spec creates the repo's session slot; keep that out of the
+        # real ~/.pi/agent/sessions
+        self.sessions = Path(self._tmp.name) / "pi-sessions"
+        self._sessions_patch = patch(
+            "myai.sandbox.provision.host_sessions_dir", return_value=self.sessions
+        )
+        self._sessions_patch.start()
+        # ...and the user's real ~/.myai/sandbox.json out of every config load
+        self.global_dir = Path(self._tmp.name) / "dot-myai"
+        self.global_dir.mkdir()
+        self._global_patch = patch("myai.paths.global_myai_dir", return_value=self.global_dir)
+        self._global_patch.start()
+
+    def write_global(self, data: dict) -> None:
+        (self.global_dir / "sandbox.json").write_text(json.dumps(data), encoding="utf-8")
 
     def tearDown(self) -> None:
+        self._global_patch.stop()
+        self._sessions_patch.stop()
         if self._old_home is None:
             os.environ.pop("MYAI_HOME", None)
         else:
@@ -809,23 +844,45 @@ class VmSpecTests(SandboxTestCase):
             repo = Path(tmp)
             cfg = SandboxConfig(share_host_sessions=True, install_pi_at_boot=False)
             _, data = self._plan_spec(repo, cfg, [])
-            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
-            self.assertIn(f"{GUEST_AGENT_PATH}/sessions", guest_paths)
-            sessions_mount = next(
-                m for m in data["vfs"]["mounts"] if m["guestPath"] == f"{GUEST_AGENT_PATH}/sessions"
-            )
+            slot = session_dir_name(str(repo.resolve()))
+            mounts = {m["guestPath"]: m for m in data["vfs"]["mounts"]}
+            # only this repo's slot, never the tree holding every project's transcripts
+            self.assertNotIn(f"{GUEST_AGENT_PATH}/sessions", mounts)
             self.assertEqual(
-                sessions_mount["hostPath"],
-                str(host_sessions_dir().resolve()),
+                mounts[f"{GUEST_AGENT_PATH}/sessions/{slot}"]["hostPath"],
+                str((self.sessions / slot).resolve()),
             )
+
+    def test_build_run_spec_workspace_mode_mounts_repo_slot_as_workspace_slot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(
+                share_host_sessions=True, guest_repo_mount="workspace", install_pi_at_boot=False
+            )
+            _, data = self._plan_spec(repo, cfg, [])
+            mounts = {m["guestPath"]: m for m in data["vfs"]["mounts"]}
+            self.assertEqual(
+                mounts[f"{GUEST_AGENT_PATH}/sessions/--workspace--"]["hostPath"],
+                str((self.sessions / session_dir_name(str(repo.resolve()))).resolve()),
+            )
+
+    def test_build_provision_spec_has_no_sessions_mount(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = SandboxConfig(share_host_sessions=True)
+            plan = build_provision_plan(repo, cfg)
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            for mount in data["vfs"]["mounts"]:
+                self.assertNotIn("/sessions", mount["guestPath"])
 
     def test_build_run_spec_no_sessions_mount_when_disabled(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             cfg = SandboxConfig(share_host_sessions=False, install_pi_at_boot=False)
             _, data = self._plan_spec(repo, cfg, [])
-            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
-            self.assertNotIn(f"{GUEST_AGENT_PATH}/sessions", guest_paths)
+            for mount in data["vfs"]["mounts"]:
+                self.assertNotIn("/sessions", mount["guestPath"])
 
     def test_prepare_agent_dir_sessions_is_real_dir_not_symlink(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -851,6 +908,9 @@ class ProvisionStateTests(SandboxTestCase):
             path = pi_bin_dir() / tool
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("", encoding="utf-8")
+        self.assertFalse(is_provisioned(cfg), "git bundle missing -> not provisioned")
+        (pi_bin_dir() / "git").write_text("", encoding="utf-8")
+        (git_bundle_dir() / "libexec" / "git-core").mkdir(parents=True, exist_ok=True)
         self.assertTrue(is_provisioned(cfg))
         self.assertFalse(needs_provision(cfg))
 
@@ -894,6 +954,7 @@ class CliOverrideTests(SandboxTestCase):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             save_repo_config(repo, _loopback_cfg())
+            trust_repo(repo)
             args = Namespace(
                 model_endpoint=None,
                 allow_hosts=[],
@@ -1067,41 +1128,81 @@ class AutoApproveTests(SandboxTestCase):
         self.assertNotIn("-a", args)
 
 
-class WorkspaceSessionLinkTests(SandboxTestCase):
+class SessionSlotTests(SandboxTestCase):
     def test_session_dir_name_encoding(self) -> None:
         self.assertEqual(session_dir_name("/workspace"), "--workspace--")
         self.assertEqual(session_dir_name("/home/a/proj"), "--home-a-proj--")
 
-    def test_no_link_for_host_path_mode(self) -> None:
+    def test_slot_mount_none_when_sessions_not_shared(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = SandboxConfig(share_host_sessions=False)
+            self.assertIsNone(session_slot_mount(Path(tmp), cfg))
+
+    def test_slot_mount_host_path_mode_uses_same_name_both_sides(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            cfg = SandboxConfig(guest_repo_mount="host_path")
-            self.assertIsNone(prepare_workspace_session_link(repo, cfg))
+            slot = session_slot_mount(repo, SandboxConfig(guest_repo_mount="host_path"))
+            assert slot is not None
+            host_dir, guest_name = slot
+            self.assertEqual(guest_name, session_dir_name(str(repo.resolve())))
+            self.assertEqual(host_dir, self.sessions / guest_name)
+            self.assertTrue(host_dir.is_dir())
 
-    def test_workspace_mode_links_to_repo_session_dir(self) -> None:
+    def test_slot_mount_workspace_mode_needs_no_symlink_on_host(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            slot = session_slot_mount(repo, SandboxConfig(guest_repo_mount="workspace"))
+            assert slot is not None
+            host_dir, guest_name = slot
+            self.assertEqual(guest_name, "--workspace--")
+            self.assertEqual(host_dir.name, session_dir_name(str(repo.resolve())))
+            self.assertFalse((self.sessions / "--workspace--").exists())
+
+    def test_stale_workspace_link_from_older_versions_is_removed(self) -> None:
+        self.sessions.mkdir(parents=True)
+        target = self.sessions / "--some-repo--"
+        target.mkdir()
+        link = self.sessions / "--workspace--"
+        link.symlink_to(target)
+
+        remove_stale_workspace_link()
+
+        self.assertFalse(link.is_symlink())
+        self.assertTrue(target.is_dir())
+
+    def test_real_workspace_slot_dir_is_left_alone(self) -> None:
+        real = self.sessions / "--workspace--"
+        real.mkdir(parents=True)
+        remove_stale_workspace_link()
+        self.assertTrue(real.is_dir())
+
+    def test_scrub_removes_symlinks_guest_left_in_slot(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
-            sessions = Path(tmp) / "sessions"
-            cfg = SandboxConfig(guest_repo_mount="workspace", share_host_sessions=True)
-            with patch("myai.sandbox.provision.host_sessions_dir", return_value=sessions):
-                link = prepare_workspace_session_link(repo, cfg)
-                self.assertIsNotNone(link)
-                assert link is not None
-                self.assertTrue(link.is_symlink())
-                self.assertEqual(link.name, "--workspace--")
-                self.assertEqual(
-                    link.resolve(),
-                    (sessions / session_dir_name(str(repo.resolve()))).resolve(),
-                )
-                cleanup_workspace_session_link(link)
-                self.assertFalse(link.exists())
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("keep", encoding="utf-8")
+            cfg = SandboxConfig()
+            slot = session_slot_mount(repo, cfg)
+            assert slot is not None
+            host_dir = slot[0]
+            (host_dir / "real.jsonl").write_text("{}", encoding="utf-8")
+            (host_dir / "planted.jsonl").symlink_to(victim)
+            (host_dir / "nested").mkdir()
+            (host_dir / "nested" / "dir-link").symlink_to(tmp)
 
-    def test_no_link_when_sessions_not_shared(self) -> None:
+            removed = scrub_session_symlinks(repo, cfg)
+
+            self.assertEqual(len(removed), 2)
+            self.assertTrue((host_dir / "real.jsonl").is_file())
+            self.assertFalse((host_dir / "planted.jsonl").is_symlink())
+            self.assertFalse((host_dir / "nested" / "dir-link").is_symlink())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
+    def test_scrub_is_noop_when_sessions_not_shared(self) -> None:
         with TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            cfg = SandboxConfig(guest_repo_mount="workspace", share_host_sessions=False)
-            self.assertIsNone(prepare_workspace_session_link(repo, cfg))
+            cfg = SandboxConfig(share_host_sessions=False)
+            self.assertEqual(scrub_session_symlinks(Path(tmp), cfg), [])
 
 
 class DebugAuditTests(SandboxTestCase):
@@ -1134,6 +1235,593 @@ class DebugAuditTests(SandboxTestCase):
     def test_read_debug_missing_exes_empty_when_absent(self) -> None:
         with TemporaryDirectory() as tmp:
             self.assertEqual(read_debug_missing_exes(Path(tmp)), [])
+
+
+def _run_args(**overrides):
+    from argparse import Namespace
+
+    base = dict(
+        model_endpoint=None,
+        allow_hosts=[],
+        providers=[],
+        network_policy=None,
+        vmm=None,
+        image=None,
+        rootfs_size=None,
+        ro=False,
+        guest_hidden_paths=[],
+        git_commit=False,
+        git_write=False,
+        host_loopback=False,
+        no_host_loopback=False,
+        no_auto_approve=False,
+        mirror_host_pi=False,
+    )
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def _write_repo_config(repo: Path, data: dict) -> Path:
+    path = repo / ".myai" / "sandbox.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+class TrustTests(SandboxTestCase):
+    def test_repo_without_config_needs_no_trust(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.assertTrue(is_trusted(repo))
+            self.assertEqual(load_trusted_config(repo).network_policy, "custom")
+
+    def test_unapproved_repo_config_is_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"network_policy": "allow-all"})
+            self.assertFalse(is_trusted(repo))
+            with self.assertRaises(UntrustedConfigError) as ctx:
+                load_trusted_config(repo)
+            self.assertIn("myai sandbox trust", str(ctx.exception))
+
+    def test_approved_config_loads_and_any_edit_revokes_it(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            path = _write_repo_config(repo, {"providers": ["anthropic"]})
+            trust_repo(repo)
+            self.assertEqual(load_trusted_config(repo).providers, ["anthropic"])
+
+            path.write_text(json.dumps({"providers": ["anthropic"], "allow_hosts": ["evil.example"]}))
+            self.assertFalse(is_trusted(repo))
+            with self.assertRaises(UntrustedConfigError):
+                load_trusted_config(repo)
+
+    def test_whitespace_only_edit_also_needs_reapproval(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            path = _write_repo_config(repo, {"providers": ["anthropic"]})
+            trust_repo(repo)
+            path.write_text(path.read_text() + "\n")
+            self.assertFalse(is_trusted(repo))
+
+    def test_trust_is_per_repo_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a", Path(tmp) / "b"
+            for repo in (a, b):
+                _write_repo_config(repo, {"providers": ["anthropic"]})
+            trust_repo(a)
+            self.assertTrue(is_trusted(a))
+            self.assertFalse(is_trusted(b))
+
+    def test_revoke(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {})
+            trust_repo(repo)
+            self.assertTrue(revoke_repo(repo))
+            self.assertFalse(is_trusted(repo))
+            self.assertFalse(revoke_repo(repo))
+
+    def test_ignore_repo_config_runs_on_global_alone(self) -> None:
+        self.write_global({"providers": ["openai"]})
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"network_policy": "allow-all"})
+            cfg = load_trusted_config(repo, ignore_repo_config=True)
+            self.assertEqual(cfg.network_policy, "custom")
+            self.assertEqual(cfg.providers, ["openai"])
+
+    def test_corrupt_trust_store_trusts_nothing(self) -> None:
+        from myai.paths import sandbox_trust_path
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {})
+            trust_repo(repo)
+            sandbox_trust_path().write_text("not json", encoding="utf-8")
+            self.assertFalse(is_trusted(repo))
+
+    def test_trust_store_is_private_and_outside_guest_mounted_dirs(self) -> None:
+        from myai.paths import sandbox_root, sandbox_trust_path
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {})
+            trust_repo(repo)
+            store = sandbox_trust_path()
+            self.assertEqual(store.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(sandbox_root(), store.parents)
+
+    def test_cfg_from_args_refuses_untrusted_and_honors_ignore_flag(self) -> None:
+        from myai.commands.sandbox import _cfg_from_args
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"network_policy": "allow-all"})
+            with self.assertRaises(UntrustedConfigError):
+                _cfg_from_args(repo, _run_args())
+            cfg = _cfg_from_args(repo, _run_args(ignore_repo_config=True))
+            self.assertEqual(cfg.network_policy, "custom")
+
+    def test_init_trusts_what_it_writes_and_will_not_clobber(self) -> None:
+        from argparse import Namespace
+
+        from myai.commands.sandbox import run_init
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.assertEqual(run_init(Namespace(path=str(repo), force=False)), 0)
+            self.assertTrue(is_trusted(repo))
+
+            path = repo / ".myai" / "sandbox.json"
+            path.write_text(json.dumps({"providers": ["anthropic"]}), encoding="utf-8")
+            self.assertEqual(run_init(Namespace(path=str(repo), force=False)), 1)
+            self.assertIn("anthropic", path.read_text(encoding="utf-8"))
+            self.assertEqual(run_init(Namespace(path=str(repo), force=True)), 0)
+            self.assertNotIn("anthropic", path.read_text(encoding="utf-8"))
+
+    def test_trust_command_yes_approves_and_revoke_withdraws(self) -> None:
+        from argparse import Namespace
+
+        from myai.commands.sandbox import run_trust
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"providers": ["anthropic"]})
+            self.assertEqual(run_trust(Namespace(path=str(repo), yes=True, revoke=False)), 0)
+            self.assertTrue(is_trusted(repo))
+            self.assertEqual(run_trust(Namespace(path=str(repo), yes=False, revoke=True)), 0)
+            self.assertFalse(is_trusted(repo))
+
+    def test_trust_command_declined_leaves_it_untrusted(self) -> None:
+        from argparse import Namespace
+
+        from myai.commands.sandbox import run_trust
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"providers": ["anthropic"]})
+            with patch("builtins.input", return_value="n"):
+                self.assertEqual(run_trust(Namespace(path=str(repo), yes=False, revoke=False)), 1)
+            self.assertFalse(is_trusted(repo))
+
+    def test_describe_grants_spells_out_what_matters(self) -> None:
+        cfg = SandboxConfig(
+            providers=["anthropic"],
+            host_secrets=[HostSecret(name="X", hosts=["evil.example"], env_var="AWS_SECRET_ACCESS_KEY")],
+            use_ssh_agent=True,
+            ssh_allow_hosts=["github.com"],
+            git_access="write",
+        )
+        cfg.host_loopback = HostLoopbackConfig(
+            enabled=True,
+            routes=[HostLoopbackRoute(id="db", guest_host="db.host", upstream="127.0.0.1:5432")],
+        )
+        text = "\n".join(describe_grants(cfg))
+        self.assertIn("api.anthropic.com", text)
+        self.assertIn("$AWS_SECRET_ACCESS_KEY sent to evil.example", text)
+        self.assertIn("db.host:5432 -> 127.0.0.1:5432", text)
+        self.assertIn("ssh agent is forwarded", text)
+        self.assertIn("guest can WRITE the real .git", text)
+        self.assertIn("auto-approves", text)
+
+    def test_describe_grants_flags_unrestricted_egress(self) -> None:
+        text = "\n".join(describe_grants(SandboxConfig(network_policy="allow-all")))
+        self.assertIn("UNRESTRICTED", text)
+
+
+class GlobalOnlyKeyTests(SandboxTestCase):
+    def test_repo_cannot_choose_the_host_sdk_or_pi_package(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {
+                "gondolin_package": "evil-pkg",
+                "gondolin_version": "9.9.9",
+                "pi_package": "evil-pi",
+            })
+            cfg = load_config(repo)
+            self.assertEqual(gondolin_package_spec(cfg), "@earendil-works/gondolin@0.12.0")
+            self.assertEqual(cfg.pi_package, "@earendil-works/pi-coding-agent")
+            self.assertEqual(len(cfg.warnings), 3)
+
+    def test_repo_url_version_is_dropped_before_it_can_fail_validation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"gondolin_version": "https://attacker.example/evil.tgz"})
+            cfg = load_config(repo)
+            self.assertEqual(cfg.gondolin_version, "0.12.0")
+            self.assertIn("gondolin_version", cfg.warnings[0])
+
+    def test_matching_value_in_old_full_dump_is_silent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"gondolin_version": "0.12.0"})
+            self.assertEqual(load_config(repo).warnings, [])
+
+    def test_global_config_may_set_them(self) -> None:
+        self.write_global({"gondolin_version": "0.13.1", "pi_package": "my-pi@1.0.0"})
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"gondolin_version": "0.12.0"})
+            cfg = load_config(repo)
+            self.assertEqual(cfg.gondolin_version, "0.13.1")
+            self.assertEqual(cfg.pi_package, "my-pi@1.0.0")
+            self.assertEqual(len(cfg.warnings), 1)
+
+    def test_save_repo_config_leaves_them_out(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            save_repo_config(repo, default_sandbox_config())
+            data = json.loads((repo / ".myai" / "sandbox.json").read_text(encoding="utf-8"))
+            for key in ("gondolin_package", "gondolin_version", "pi_package"):
+                self.assertNotIn(key, data)
+
+
+class MergeTests(SandboxTestCase):
+    def test_sparse_repo_file_does_not_reset_global_choices(self) -> None:
+        self.write_global({"auto_approve": False, "mount_readonly": True, "network_policy": "deny-all"})
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"version": 2})
+            cfg = load_config(repo)
+            self.assertFalse(cfg.auto_approve)
+            self.assertTrue(cfg.mount_readonly)
+            self.assertEqual(cfg.network_policy, "deny-all")
+
+    def test_repo_overrides_the_keys_it_names(self) -> None:
+        self.write_global({"auto_approve": False, "providers": ["openai"]})
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_repo_config(repo, {"providers": ["anthropic"]})
+            cfg = load_config(repo)
+            self.assertEqual(cfg.providers, ["anthropic"])
+            self.assertFalse(cfg.auto_approve)
+
+    def test_non_object_config_is_an_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            path = repo / ".myai" / "sandbox.json"
+            path.parent.mkdir()
+            path.write_text("[]", encoding="utf-8")
+            with self.assertRaises(SandboxConfigError):
+                load_config(repo)
+
+
+class ValidationTests(SandboxTestCase):
+    def test_host_patterns(self) -> None:
+        for ok in (
+            "api.anthropic.com", "*.githubcopilot.com", "localhost", "127.0.0.1",
+            "model.host:8080", DENY_ALL_SENTINEL,
+        ):
+            validate_host_pattern(ok, what="t")
+        # gondolin's * matches any substring, dots included
+        for bad in ("*", "*.*", "**", "*.com", "api.*", "*github.com", "a*b.example.com",
+                    "has space.com", "", "http://x.com", None, 5):
+            with self.assertRaises(SandboxConfigError, msg=repr(bad)):
+                validate_host_pattern(bad, what="t")
+
+    def test_wildcard_everything_in_allow_hosts_is_rejected(self) -> None:
+        with self.assertRaises(SandboxConfigError) as ctx:
+            SandboxConfig(allow_hosts=["*"]).validate()
+        self.assertIn("allow-all", str(ctx.exception))
+
+    def test_every_known_provider_domain_is_a_valid_pattern(self) -> None:
+        from myai.sandbox.config import PROVIDER_DOMAINS
+
+        for domains in PROVIDER_DOMAINS.values():
+            for domain in domains:
+                validate_host_pattern(domain, what="provider")
+
+    def test_secret_hosts_and_names(self) -> None:
+        HostSecret(name="ANTHROPIC_API_KEY", hosts=["api.anthropic.com"]).validate()
+        HostSecret(name="X", hosts=["a.example.com"], env_var="REAL_NAME").validate()
+        for bad in (
+            HostSecret(name="X", hosts=["*"]),
+            HostSecret(name="X", hosts=[]),
+            HostSecret(name="has space", hosts=["a.example.com"]),
+            HostSecret(name="X=1", hosts=["a.example.com"]),
+            HostSecret(name="X", hosts=["a.example.com"], env_var="A B"),
+            HostSecret(name="NODE_OPTIONS", hosts=["a.example.com"]),
+            HostSecret(name="path", hosts=["a.example.com"]),
+            HostSecret(name="LD_PRELOAD", hosts=["a.example.com"]),
+        ):
+            with self.assertRaises(SandboxConfigError, msg=repr(bad)):
+                bad.validate()
+
+    def test_gondolin_version_must_be_exact(self) -> None:
+        SandboxConfig(gondolin_version="0.12.0").validate()
+        SandboxConfig(gondolin_version="1.0.0-beta.2").validate()
+        SandboxConfig(gondolin_version="latest").validate()
+        for bad in ("https://attacker.example/evil.tgz", "github:a/b", "^0.12.0", "0.12",
+                    "file:../x", "0.12.0 || 1", ""):
+            with self.assertRaises(SandboxConfigError, msg=bad):
+                SandboxConfig(gondolin_version=bad).validate()
+
+    def test_package_names(self) -> None:
+        SandboxConfig(gondolin_package="@scope/pkg", pi_package="@scope/pi@1.2.3").validate()
+        SandboxConfig(pi_package="pi-agent@next").validate()
+        for bad in ("evil; rm -rf /", "../x", "https://x/y.tgz", "a b", "$(id)", ""):
+            with self.assertRaises(SandboxConfigError, msg=bad):
+                SandboxConfig(gondolin_package=bad).validate()
+        for bad in ("left-pad; touch /opt/pi/INJECTED #", "git+https://x/y", "a@b@c", "$(id)", "`id`"):
+            with self.assertRaises(SandboxConfigError, msg=bad):
+                SandboxConfig(pi_package=bad).validate()
+
+    def test_provision_shell_quotes_the_package(self) -> None:
+        cfg = SandboxConfig(pi_package="@scope/pi@1.2.3")
+        script = build_provision_shell(cfg)[1][1]
+        self.assertIn("--ignore-scripts '@scope/pi@1.2.3';", script)
+
+
+class HiddenPathTests(SandboxTestCase):
+    def test_myai_is_hidden_even_if_config_drops_it(self) -> None:
+        for paths in ([], ["/secrets"], ["/.myai"]):
+            cfg = SandboxConfig(guest_hidden_paths=paths)
+            self.assertEqual(effective_hidden_paths(cfg)[0], "/.myai")
+            self.assertEqual(effective_hidden_paths(cfg).count("/.myai"), 1)
+
+    def test_run_spec_always_hides_myai(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cfg = SandboxConfig(guest_hidden_paths=["/secrets"], install_pi_at_boot=False)
+            plan = build_run_plan(Path(tmp), cfg, [])
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            self.assertEqual(data["vfs"]["workspace"]["hiddenPaths"], ["/.myai", "/secrets"])
+
+    def test_hide_flag_adds_to_the_list(self) -> None:
+        from myai.commands.sandbox import _cfg_from_args
+
+        with TemporaryDirectory() as tmp:
+            cfg = _cfg_from_args(Path(tmp), _run_args(guest_hidden_paths=["/secrets", "/.myai"]))
+            self.assertEqual(cfg.guest_hidden_paths, ["/.myai", "/secrets"])
+
+
+class GitAccessTests(SandboxTestCase):
+    def _workspace(self, cfg: SandboxConfig) -> dict:
+        with TemporaryDirectory() as tmp:
+            plan = build_run_plan(Path(tmp), cfg, [])
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            return data["vfs"]["workspace"]
+
+    def test_read_only_is_the_default(self) -> None:
+        self.assertEqual(SandboxConfig().git_access, "read-only")
+        self.assertTrue(self._workspace(SandboxConfig(install_pi_at_boot=False))["gitReadonly"])
+
+    def test_commit_mode_keeps_real_git_read_only(self) -> None:
+        # commit mode must NOT make the real .git writable; it uses a scratch clone
+        self.assertTrue(self._workspace(SandboxConfig(git_access="commit", install_pi_at_boot=False))["gitReadonly"])
+
+    def test_write_mode_lifts_it(self) -> None:
+        self.assertFalse(self._workspace(SandboxConfig(git_access="write", install_pi_at_boot=False))["gitReadonly"])
+
+    def test_flags_map_to_access(self) -> None:
+        from myai.commands.sandbox import _cfg_from_args
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.assertEqual(_cfg_from_args(repo, _run_args(git_commit=True)).git_access, "commit")
+            self.assertEqual(_cfg_from_args(repo, _run_args(git_write=True)).git_access, "write")
+            self.assertEqual(_cfg_from_args(repo, _run_args()).git_access, "read-only")
+
+    def test_roundtrip_and_legacy_key(self) -> None:
+        self.assertEqual(_config_from_dict(_config_to_dict(SandboxConfig(git_access="commit"))).git_access, "commit")
+        self.assertEqual(_config_from_dict({"guest_git_readonly": False}).git_access, "write")
+        self.assertEqual(_config_from_dict({"guest_git_readonly": True}).git_access, "read-only")
+
+    def test_invalid_access_rejected(self) -> None:
+        with self.assertRaises(SandboxConfigError):
+            SandboxConfig(git_access="sometimes").validate()
+
+
+class CacheMountTests(SandboxTestCase):
+    def _mounts(self, plan) -> dict:
+        data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+        plan.spec_path.unlink()
+        return {m["guestPath"]: m for m in data["vfs"]["mounts"]}
+
+    def test_pi_caches_are_read_only_at_runtime(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mounts = self._mounts(build_run_plan(Path(tmp), SandboxConfig(mirror_host_pi=True), []))
+            for guest in ("/opt/pi", f"{GUEST_AGENT_PATH}/bin", f"{GUEST_AGENT_PATH}/npm", f"{GUEST_AGENT_PATH}/git"):
+                self.assertTrue(mounts[guest]["readonly"], guest)
+            # pi keeps per-run state here; wiped before every run
+            self.assertFalse(mounts[GUEST_AGENT_PATH].get("readonly", False))
+
+    def test_only_the_install_vm_can_write_them(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mounts = self._mounts(build_provision_plan(Path(tmp), SandboxConfig(mirror_host_pi=True)))
+            for guest in ("/opt/pi", f"{GUEST_AGENT_PATH}/bin", f"{GUEST_AGENT_PATH}/npm"):
+                self.assertFalse(mounts[guest]["readonly"], guest)
+
+
+class LoopbackPolicyTests(SandboxTestCase):
+    def test_deny_all_means_no_host_ports_either(self) -> None:
+        cfg = _loopback_cfg(network_policy="deny-all")
+        cfg.validate()
+        self.assertFalse(resolve_host_loopback_enabled(cfg))
+        self.assertEqual(resolve_host_loopback_routes(cfg), [])
+        self.assertEqual(render_models_json(cfg), "{}\n")
+        with TemporaryDirectory() as tmp:
+            plan = build_run_plan(Path(tmp), cfg, [])
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            self.assertEqual(data["network"]["tcpHosts"], {})
+            self.assertEqual(data["network"]["allowedHosts"], [DENY_ALL_SENTINEL])
+
+    def test_deny_all_beats_the_env_switch(self) -> None:
+        os.environ["MYAI_HOST_LOOPBACK"] = "1"
+        self.assertFalse(resolve_host_loopback_enabled(SandboxConfig(network_policy="deny-all")))
+
+    def test_custom_with_empty_allow_list_still_reaches_loopback(self) -> None:
+        hosts, unrestricted = runtime_allow_host_args(_loopback_cfg())
+        self.assertFalse(unrestricted)
+        self.assertIn("model.host", hosts)
+
+    def _route_cfg(self, upstream: str, *, allow_remote: bool = False) -> SandboxConfig:
+        cfg = SandboxConfig()
+        cfg.host_loopback = HostLoopbackConfig(
+            enabled=True,
+            allow_remote_upstreams=allow_remote,
+            routes=[HostLoopbackRoute(id="r", guest_host="r.host", upstream=upstream)],
+        )
+        return cfg
+
+    def test_loopback_upstreams_are_fine(self) -> None:
+        for upstream in ("http://localhost:8080/v1", "127.0.0.1:5432", "http://[::1]:9000", "127.1.2.3:80"):
+            self._route_cfg(upstream).validate()
+
+    def test_other_machines_need_the_opt_in(self) -> None:
+        for upstream in ("http://192.168.1.50:8080/v1", "10.0.0.5:5432", "http://nas.local:8080", "8.8.8.8:53"):
+            with self.assertRaises(SandboxConfigError, msg=upstream) as ctx:
+                self._route_cfg(upstream).validate()
+            self.assertIn("allow_remote_upstreams", str(ctx.exception))
+            self._route_cfg(upstream, allow_remote=True).validate()
+
+    def test_link_local_is_never_bridged(self) -> None:
+        for upstream in ("169.254.169.254:80", "http://169.254.169.254/latest", "0.0.0.0:80", "http://[fe80::1]:80"):
+            with self.assertRaises(SandboxConfigError, msg=upstream):
+                self._route_cfg(upstream, allow_remote=True).validate()
+
+    def test_bad_route_is_caught_at_use_even_if_only_env_enables_loopback(self) -> None:
+        cfg = self._route_cfg("10.0.0.5:5432")
+        cfg.host_loopback.enabled = False
+        cfg.validate()
+        os.environ["MYAI_HOST_LOOPBACK"] = "1"
+        with self.assertRaises(SandboxConfigError):
+            resolve_host_loopback_routes(cfg)
+
+    def test_allow_remote_upstream_flag_and_roundtrip(self) -> None:
+        from myai.commands.sandbox import _cfg_from_args
+
+        with TemporaryDirectory() as tmp:
+            args = _run_args(model_endpoint="http://192.168.1.50:8080/v1")
+            with self.assertRaises(SandboxConfigError):
+                _cfg_from_args(Path(tmp), args)
+            args.allow_remote_upstream = True
+            cfg = _cfg_from_args(Path(tmp), args)
+            self.assertTrue(cfg.host_loopback.allow_remote_upstreams)
+            again = _config_from_dict(_config_to_dict(cfg))
+            self.assertTrue(again.host_loopback.allow_remote_upstreams)
+
+
+class CheckMountableTests(SandboxTestCase):
+    def test_project_dir_is_fine(self) -> None:
+        with TemporaryDirectory() as tmp:
+            check_mountable(Path(tmp))
+
+    def test_refuses_dirs_that_contain_myai_state_or_home(self) -> None:
+        state = Path(self._tmp.name)
+        with self.assertRaises(GondolinError):
+            check_mountable(state)
+        with self.assertRaises(GondolinError):
+            check_mountable(state.parent)
+        with self.assertRaises(GondolinError):
+            check_mountable(Path.home())
+        with self.assertRaises(GondolinError):
+            check_mountable(Path("/"))
+
+
+def _parse(lines):
+    from myai.sandbox.vm_spec import _parse_env_lines
+    return _parse_env_lines(lines)
+
+
+class GitBundleTests(SandboxTestCase):
+    def test_provision_shell_stages_git_into_persistent_mounts(self) -> None:
+        script = build_git_bundle_shell()
+        self.assertIn("apk add --no-cache git", script)
+        self.assertIn(f"{GUEST_AGENT_PATH}/bin/git", script)   # binary -> pi-bin (on PATH)
+        self.assertIn("/opt/git/libexec/git-core", script)     # helpers -> bundle
+        self.assertIn("/opt/git/lib", script)                  # shared libs -> bundle
+        self.assertIn("cp -a", script)                         # keep git-core hardlinks
+        # skip the work if it is already staged
+        self.assertIn(f'if ! [ -x "{GUEST_AGENT_PATH}/bin/git"', script)
+
+    def test_build_provision_shell_includes_git_bundle(self) -> None:
+        _, args = build_provision_shell(SandboxConfig(install_pi_at_boot=True))
+        self.assertIn("/opt/git/libexec/git-core", args[1])
+
+    def test_run_spec_mounts_git_bundle_read_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            plan = build_run_plan(Path(tmp), SandboxConfig(), [])
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            mounts = {m["guestPath"]: m for m in data["vfs"]["mounts"]}
+            self.assertIn("/opt/git", mounts)
+            self.assertTrue(mounts["/opt/git"]["readonly"])
+
+    def test_provision_spec_mounts_git_bundle_writable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            plan = build_provision_plan(Path(tmp), SandboxConfig())
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            mounts = {m["guestPath"]: m for m in data["vfs"]["mounts"]}
+            self.assertFalse(mounts["/opt/git"]["readonly"])
+
+    def test_guest_env_wires_git_onto_path_and_exec(self) -> None:
+        env = _parse(guest_agent_env(SandboxConfig()))
+        self.assertEqual(env["GIT_EXEC_PATH"], "/opt/git/libexec/git-core")
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/opt/git/lib")
+        self.assertIn(f"{GUEST_AGENT_PATH}/bin", env["PATH"].split(":"))
+
+    def test_alpine_mirror_allowed_at_provision_for_git(self) -> None:
+        # git is always apk-installed during provisioning, so the mirror is allowed
+        self.assertIn(ALPINE_MIRROR_HOST, provision_allow_hosts(SandboxConfig()))
+        self.assertNotIn(ALPINE_MIRROR_HOST, effective_allow_hosts(SandboxConfig()))
+
+    def test_commit_mode_wires_git_dir_and_worktree(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            env = _parse(guest_agent_env(SandboxConfig(git_access="commit"), repo=repo))
+            self.assertEqual(env["GIT_DIR"], "/root/agent-git")
+            self.assertEqual(env["GIT_WORK_TREE"], str(repo.resolve()))
+            self.assertTrue(env["GIT_CONFIG_GLOBAL"].endswith("/gitconfig"))
+
+    def test_no_git_dir_when_not_commit_mode_or_not_a_repo(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.assertNotIn("GIT_DIR", _parse(guest_agent_env(SandboxConfig(), repo=repo)))
+            (repo / ".git").mkdir()
+            self.assertIn("GIT_DIR", _parse(guest_agent_env(SandboxConfig(git_access="commit"), repo=repo)))
+
+    def test_commit_mode_mounts_scratch_git_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            plan = build_run_plan(repo, SandboxConfig(git_access="commit"), [])
+            data = json.loads(plan.spec_path.read_text(encoding="utf-8"))
+            plan.spec_path.unlink()
+            guest_paths = [m["guestPath"] for m in data["vfs"]["mounts"]]
+            self.assertIn("/root/agent-git", guest_paths)
+
+    def test_gitconfig_written_for_default_image(self) -> None:
+        with TemporaryDirectory() as tmp:
+            staging = prepare_agent_dir(Path(tmp), SandboxConfig())
+            text = (staging / "gitconfig").read_text(encoding="utf-8")
+            self.assertIn("directory = *", text)
+            self.assertIn("[user]", text)
 
 
 class ConfigRoundtripNewFieldsTests(SandboxTestCase):

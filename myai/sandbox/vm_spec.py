@@ -10,25 +10,31 @@ from typing import Any
 
 from myai.sandbox.config import (
     DEFAULT_IMAGE,
+    GIT_BUNDLE_MOUNT,
     GUEST_AGENT_PATH,
     PI_INSTALL_MOUNT,
     SandboxConfig,
+    git_commit_mode,
+    real_git_readonly,
+    effective_hidden_paths,
     effective_rootfs_size,
     effective_workspace_path,
-    host_sessions_dir,
     provision_allow_hosts,
     resolve_host_loopback_enabled,
     resolve_host_loopback_routes,
     runtime_allow_host_args,
 )
+from myai.sandbox.agent_git import layout as agent_git_layout
 from myai.sandbox.provision import (
     build_pi_launch_shell,
     build_provision_shell,
     guest_agent_env,
     pi_bin_dir,
     pi_install_dir,
+    git_bundle_dir,
     pi_pkg_dir,
     prepare_agent_dir,
+    session_slot_mount,
 )
 
 
@@ -99,6 +105,8 @@ def _build_vfs_mounts(
     repo: Path,
     cfg: SandboxConfig,
     staging: Path,
+    *,
+    provision: bool,
 ) -> dict[str, Any]:
     ws = effective_workspace_path(repo, cfg)
     mounts: list[dict[str, Any]] = [
@@ -107,36 +115,64 @@ def _build_vfs_mounts(
             "guestPath": GUEST_AGENT_PATH,
         },
     ]
-    if cfg.share_host_sessions:
-        sessions = host_sessions_dir()
-        sessions.mkdir(parents=True, exist_ok=True)
+    # The install VM has no use for transcripts.
+    slot = None if provision else session_slot_mount(repo, cfg)
+    if slot is not None:
+        host_slot, guest_name = slot
         mounts.append({
-            "hostPath": str(sessions.resolve()),
-            "guestPath": f"{GUEST_AGENT_PATH}/sessions",
+            "hostPath": str(host_slot.resolve()),
+            "guestPath": f"{GUEST_AGENT_PATH}/sessions/{guest_name}",
         })
 
     if cfg.install_pi_at_boot and cfg.image == DEFAULT_IMAGE:
+        # One pi install serves every repo's sandbox, so only the install VM may
+        # write it; a run that could would carry over into all later runs.
+        cache_readonly = not provision
+        cache_dirs = [pi_install_dir(), pi_bin_dir()]
+        if cfg.mirror_host_pi:
+            cache_dirs += [pi_pkg_dir(sub) for sub in ("npm", "git")]
+        for cache_dir in cache_dirs:
+            cache_dir.mkdir(parents=True, exist_ok=True)
         mounts.append({
             "hostPath": str(pi_install_dir().resolve()),
             "guestPath": PI_INSTALL_MOUNT,
+            "readonly": cache_readonly,
         })
         mounts.append({
             "hostPath": str(pi_bin_dir().resolve()),
             "guestPath": f"{GUEST_AGENT_PATH}/bin",
+            "readonly": cache_readonly,
+        })
+        bundle = git_bundle_dir()
+        bundle.mkdir(parents=True, exist_ok=True)
+        mounts.append({
+            "hostPath": str(bundle.resolve()),
+            "guestPath": GIT_BUNDLE_MOUNT,
+            "readonly": cache_readonly,
         })
         if cfg.mirror_host_pi:
             for sub in ("npm", "git"):
                 mounts.append({
                     "hostPath": str(pi_pkg_dir(sub).resolve()),
                     "guestPath": f"{GUEST_AGENT_PATH}/{sub}",
+                    "readonly": cache_readonly,
                 })
+
+    if not provision and git_commit_mode(cfg) and (repo / ".git").is_dir():
+        lay = agent_git_layout(repo, cfg)
+        mounts.append({
+            "hostPath": str(lay.host_git_dir.resolve()),
+            "guestPath": lay.guest_git_dir,
+        })
 
     return {
         "workspace": {
             "hostPath": str(repo.resolve()),
             "guestPath": ws,
             "readonly": cfg.mount_readonly,
-            "hiddenPaths": list(cfg.guest_hidden_paths),
+            "hiddenPaths": effective_hidden_paths(cfg),
+            # the real .git is never guest-writable except in the 'write' escape hatch
+            "gitReadonly": real_git_readonly(cfg),
         },
         "mounts": mounts,
         "memfs": ["/tmp"],
@@ -156,7 +192,7 @@ def build_run_spec(
     shell_cmd, shell_args = build_pi_launch_shell(cfg, pi_args, ws)
     spec = _base_spec(repo, cfg, staging, provision=False)
     spec["cwd"] = ws
-    spec["env"] = _parse_env_lines(guest_agent_env(cfg, debug=debug))
+    spec["env"] = _parse_env_lines(guest_agent_env(cfg, repo=repo, debug=debug))
     spec["command"] = [shell_cmd, *shell_args]
     spec["interactive"] = True
     spec["debug"] = debug
@@ -193,5 +229,5 @@ def _base_spec(
         "vmm": _resolve_vmm(cfg.vmm),
         "rootfsSize": effective_rootfs_size(cfg),
         "network": _build_network(cfg, provision=provision),
-        "vfs": _build_vfs_mounts(repo, cfg, staging),
+        "vfs": _build_vfs_mounts(repo, cfg, staging, provision=provision),
     }

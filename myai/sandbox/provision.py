@@ -12,6 +12,7 @@ from myai.paths import sandbox_root
 from myai.sandbox.config import (
     DEFAULT_IMAGE,
     DEFAULT_MODEL_ID,
+    GIT_BUNDLE_MOUNT,
     GUEST_AGENT_PATH,
     PI_INSTALL_MOUNT,
     WORKSPACE_PATH,
@@ -61,6 +62,22 @@ def pi_pkg_dir(name: str) -> Path:
     return sandbox_root() / "pi-pkgs" / name
 
 
+# The base image has no git. During provisioning (network available) we install
+# it and copy the binary into the persistent pi-bin, plus its git-core helpers and
+# musl shared-lib closure into git-bundle/, so every cold-boot run has a working
+# git with no runtime network. git dispatches its builtins from one binary, so
+# local commit/branch/status/diff/log/rebase all work; only remote transport
+# would need more. GIT_BUNDLE_MOUNT is its guest path (imported above).
+def git_bundle_dir() -> Path:
+    return sandbox_root() / "git-bundle"
+
+
+def git_bundle_ready() -> bool:
+    return (pi_bin_dir() / "git").is_file() and (
+        git_bundle_dir() / "libexec" / "git-core"
+    ).is_dir()
+
+
 def is_provisioned(cfg: SandboxConfig) -> bool:
     if not (cfg.install_pi_at_boot and cfg.image == DEFAULT_IMAGE):
         return True
@@ -70,7 +87,7 @@ def is_provisioned(cfg: SandboxConfig) -> bool:
     for tool in ("fd", "rg"):
         if not (pi_bin_dir() / tool).is_file():
             return False
-    return True
+    return git_bundle_ready()
 
 
 def needs_provision(cfg: SandboxConfig, *, force: bool = False) -> bool:
@@ -108,9 +125,31 @@ def prepare_agent_dir(repo: Path, cfg: SandboxConfig, *, debug: bool = False) ->
     # symlink does not work: RealFSProvider cannot follow targets outside the
     # staging mount root, so guest mkdir fails with ENOENT.
     (staging / "sessions").mkdir(exist_ok=True)
+    gitconfig = render_agent_gitconfig(cfg)
+    if gitconfig:
+        (staging / "gitconfig").write_text(gitconfig, encoding="utf-8")
     if debug:
         _write_debug_init(staging)
     return staging
+
+
+def render_agent_gitconfig(cfg: SandboxConfig) -> str | None:
+    """Guest gitconfig: trust the mounted tree (so status/diff work), and give
+    commits an author so commit mode does not fail. Written whenever the guest
+    has git, i.e. the default boot-install image."""
+    if not (cfg.install_pi_at_boot and cfg.image == DEFAULT_IMAGE):
+        return None
+    return (
+        "[safe]\n"
+        "\tdirectory = *\n"
+        "[user]\n"
+        "\tname = sandbox agent\n"
+        "\temail = agent@myai.sandbox\n"
+        "[commit]\n"
+        "\tgpgsign = false\n"
+        "[gc]\n"
+        "\tauto = 0\n"
+    )
 
 
 def _write_debug_init(staging: Path) -> None:
@@ -148,35 +187,53 @@ def session_dir_name(path: str) -> str:
     return f"--{inner}--"
 
 
-def prepare_workspace_session_link(repo: Path, cfg: SandboxConfig) -> Path | None:
-    """Link the ``/workspace`` session slot to the repo's real session dir.
+def session_slot_mount(repo: Path, cfg: SandboxConfig) -> tuple[Path, str] | None:
+    """(host dir, guest slot name) for sharing this repo's pi sessions, or None.
 
-    In ``workspace`` mount mode the guest cwd is ``/workspace``, so pi names its
-    session dir ``--workspace--`` instead of one derived from the repo path. With
-    shared host sessions that would orphan sessions in a slot unrelated to the
-    repo. We symlink ``--workspace--`` to the repo's real session dir so host and
-    guest share one pool. No-op for ``host_path`` mode or when sessions aren't
-    shared. Returns the link path to clean up, or None.
+    Only the repo's own slot is shared. The sessions tree holds transcripts from
+    every project on the machine; a guest has no business reading the others, or
+    planting one the user later resumes outside the sandbox.
+
+    pi names a slot after its cwd, so in ``workspace`` mode the guest looks for
+    ``--workspace--``; mounting the repo's real slot under that name keeps host
+    and guest on one pool without a symlink in the host tree.
     """
-    if cfg.guest_repo_mount != "workspace" or not cfg.share_host_sessions:
+    if not cfg.share_host_sessions:
         return None
-    sessions = host_sessions_dir()
-    sessions.mkdir(parents=True, exist_ok=True)
-    link = sessions / session_dir_name(WORKSPACE_PATH)
-    target = sessions / session_dir_name(str(repo.resolve()))
-    target.mkdir(parents=True, exist_ok=True)
+    host_slot = host_sessions_dir() / session_dir_name(str(repo.resolve()))
+    host_slot.mkdir(parents=True, exist_ok=True)
+    guest_cwd = WORKSPACE_PATH if cfg.guest_repo_mount == "workspace" else str(repo.resolve())
+    return host_slot, session_dir_name(guest_cwd)
+
+
+def remove_stale_workspace_link() -> None:
+    """Older versions symlinked ``--workspace--`` into the host sessions tree and
+    could leave it behind after a crash. Nothing creates it any more."""
+    link = host_sessions_dir() / session_dir_name(WORKSPACE_PATH)
     if link.is_symlink():
-        link.unlink()  # stale link from a crashed run
-    elif link.exists():
-        return None  # real dir already there, leave it
-    link.symlink_to(target)
-    return link
-
-
-def cleanup_workspace_session_link(link: Path | None) -> None:
-    """Remove the ``--workspace--`` symlink created by prepare_workspace_session_link."""
-    if link is not None and link.is_symlink():
         link.unlink()
+
+
+def scrub_session_symlinks(repo: Path, cfg: SandboxConfig) -> list[Path]:
+    """Remove symlinks the guest left in the shared session slot.
+
+    Sessions are plain files. A link planted there would be followed by pi on the
+    host, outside the sandbox, the next time it lists or resumes sessions.
+    """
+    if not cfg.share_host_sessions:
+        return []
+    slot = host_sessions_dir() / session_dir_name(str(repo.resolve()))
+    removed: list[Path] = []
+    if not slot.is_dir():
+        return removed
+    for root, dirs, files in os.walk(slot, followlinks=False):
+        for name in (*dirs, *files):
+            path = Path(root) / name
+            if path.is_symlink():
+                path.unlink()
+                removed.append(path)
+        dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+    return removed
 
 
 def loopback_guest_host(cfg: SandboxConfig) -> str | None:
@@ -312,10 +369,26 @@ def render_global_system_md() -> str | None:
     return None
 
 
-def guest_agent_env(cfg: SandboxConfig, *, debug: bool = False) -> list[str]:
+def guest_agent_env(
+    cfg: SandboxConfig, *, repo: Path | None = None, debug: bool = False
+) -> list[str]:
     env = [f"PI_CODING_AGENT_DIR={GUEST_AGENT_PATH}"]
     # forward TERM so the guest matches the real terminal for color/capability detection
     env.append(f"TERM={os.environ.get('TERM') or 'xterm-256color'}")
+    from myai.sandbox.agent_git import layout as agent_git_layout
+    from myai.sandbox.config import git_commit_mode
+
+    if cfg.install_pi_at_boot and cfg.image == DEFAULT_IMAGE:
+        # git lives in pi-bin (already on PATH); its helpers and libs are in the
+        # git-bundle mount, found via these two vars.
+        env.append(f"GIT_EXEC_PATH={GIT_BUNDLE_MOUNT}/libexec/git-core")
+        env.append(f"LD_LIBRARY_PATH={GIT_BUNDLE_MOUNT}/lib")
+        env.append(f"PATH={GUEST_AGENT_PATH}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    if repo is not None and git_commit_mode(cfg) and (repo / ".git").is_dir():
+        lay = agent_git_layout(repo, cfg)
+        env.append(f"GIT_DIR={lay.guest_git_dir}")
+        env.append(f"GIT_WORK_TREE={lay.guest_work_tree}")
+        env.append(f"GIT_CONFIG_GLOBAL={GUEST_AGENT_PATH}/gitconfig")
     if cfg.llama_server_url:
         url = cfg.llama_server_url
         guest_host = loopback_guest_host(cfg)
@@ -327,16 +400,35 @@ def guest_agent_env(cfg: SandboxConfig, *, debug: bool = False) -> list[str]:
     return env
 
 
+def build_git_bundle_shell() -> str:
+    """Install git and stage a runnable copy in the persistent mounts.
+
+    git goes into pi-bin (already on the guest PATH); its git-core helpers and
+    shared-lib closure go into the git-bundle mount, reached at runtime via
+    GIT_EXEC_PATH and LD_LIBRARY_PATH. cp -a keeps the git-core hardlinks so the
+    3 MB git binary is not duplicated across ~160 helper names.
+    """
+    bin_dir = f"{GUEST_AGENT_PATH}/bin"
+    bundle = GIT_BUNDLE_MOUNT
+    return (
+        f'if ! [ -x "{bin_dir}/git" ]; then '
+        "apk add --no-cache git >/dev/null 2>&1; "
+        f'mkdir -p "{bin_dir}" "{bundle}/libexec/git-core" "{bundle}/lib"; '
+        f'cp /usr/bin/git "{bin_dir}/git"; '
+        f'cp -a /usr/libexec/git-core/. "{bundle}/libexec/git-core/" 2>/dev/null || true; '
+        "for f in /usr/bin/git $(find /usr/libexec/git-core -type f 2>/dev/null); do "
+        "ldd \"$f\" 2>/dev/null | awk '/=>/{print $3} /ld-musl/{print $1}'; "
+        f'done | sort -u | while read -r lib; do [ -f "$lib" ] && cp -aL "$lib" "{bundle}/lib/" 2>/dev/null || true; done; '
+        "fi; "
+    )
+
+
 def build_provision_shell(cfg: SandboxConfig) -> tuple[str, list[str]]:
-    """One-shot install script: npm pi, pre-fetch fd/rg, optional package sync."""
+    """One-shot install script: npm pi, pre-fetch fd/rg, stage git, optional sync."""
     tools_js = (
         "/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/utils/tools-manager.js"
     )
-    git_setup = (
-        "command -v git >/dev/null 2>&1 || apk add --no-cache git >/dev/null 2>&1; "
-        if cfg.mirror_host_pi
-        else ""
-    )
+    git_setup = build_git_bundle_shell()
     pkg_sync = (
         f'export PI_CODING_AGENT_DIR={GUEST_AGENT_PATH}; '
         '"$PI_BIN" update --extensions -a >/dev/null 2>&1 || true; '
@@ -350,7 +442,7 @@ def build_provision_shell(cfg: SandboxConfig) -> tuple[str, list[str]]:
         'export npm_config_cache="$PI_PREFIX/.npm-cache"; '
         'mkdir -p "$PI_PREFIX" "$npm_config_cache"; '
         'if ! [ -x "$PI_BIN" ]; then '
-        f'npm install --prefix "$PI_PREFIX" --ignore-scripts {cfg.pi_package}; '
+        f'npm install --prefix "$PI_PREFIX" --ignore-scripts {_shell_quote(cfg.pi_package)}; '
         "fi; "
         + git_setup
         + f'export PI_CODING_AGENT_DIR={GUEST_AGENT_PATH}; '

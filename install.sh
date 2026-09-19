@@ -1,11 +1,13 @@
 #!/usr/bin/env sh
-# myai end-user installer — curl -fsSL https://raw.githubusercontent.com/OWNER/myai/main/install.sh | sh
+# myai end-user installer — curl -fsSL https://raw.githubusercontent.com/devinreuschel/myai/main/install.sh | sh
 set -eu
 
 MYAI_INSTALL_METHOD="${MYAI_INSTALL_METHOD:-git}"
-MYAI_REPO="${MYAI_REPO:-https://github.com/OWNER/myai.git}"
+MYAI_REPO="${MYAI_REPO:-https://github.com/devinreuschel/myai.git}"
 MYAI_REF="${MYAI_REF:-main}"
-MYAI_INSTALL_DIR="${MYAI_INSTALL_DIR:-$HOME/.local/share/myai}"
+# Not ~/.local/share/myai: that is myai's runtime state root (teams db, sandbox
+# caches). Keeping the clone elsewhere means uninstall can never take state with it.
+MYAI_INSTALL_DIR="${MYAI_INSTALL_DIR:-$HOME/.local/share/myai-app}"
 MYAI_BIN_DIR="${MYAI_BIN_DIR:-$HOME/.local/bin}"
 MYAI_ASSUME_YES="${MYAI_ASSUME_YES:-0}"
 MYAI_NO_INSTALL_DEPS="${MYAI_NO_INSTALL_DEPS:-0}"
@@ -271,7 +273,7 @@ print_changes_summary() {
   info "  Python venv:          $MYAI_INSTALL_DIR/.venv  (isolated; no system pip changes)"
   info "  CLI symlink:          $MYAI_BIN_DIR/myai -> venv console script"
   info ""
-  info "Later, myai commands may create runtime state in ~/.myai/ (not created by this script)."
+  info "Later, myai commands keep runtime state in ~/.myai/ and $(state_dir) (not created by this script)."
   info ""
   info "This script will NOT modify:"
   info "  - shell config files (~/.bashrc, ~/.zshrc, etc.)"
@@ -368,20 +370,85 @@ path_contains() {
   esac
 }
 
+state_dir() {
+  if [ -n "${MYAI_HOME:-}" ]; then
+    printf '%s\n' "$MYAI_HOME"
+  else
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/myai"
+  fi
+}
+
+# A myai clone made by this script: a git repo whose pyproject names the project.
+is_myai_install() {
+  [ -d "$1/.git" ] && [ -f "$1/pyproject.toml" ] &&
+    grep -q '^name = "myai"' "$1/pyproject.toml"
+}
+
+# The install dir is rm -rf'd on uninstall, so it must never be somewhere that
+# holds anything else.
+check_install_dir() {
+  case "$MYAI_INSTALL_DIR" in
+    "" | / | "$HOME" | "$HOME/")
+      die "refusing to use '$MYAI_INSTALL_DIR' as the install dir"
+      ;;
+  esac
+  if [ "$MYAI_INSTALL_DIR" = "$(state_dir)" ]; then
+    die "MYAI_INSTALL_DIR is myai's state dir ($MYAI_INSTALL_DIR); uninstall would delete your data. Pick another directory."
+  fi
+}
+
+note_legacy_install() {
+  legacy="$(state_dir)"
+  if [ "$legacy" != "$MYAI_INSTALL_DIR" ] && [ -d "$legacy/.git" ]; then
+    info "note: an older myai clone lives in $legacy, mixed in with myai's state."
+    info "      This installer no longer touches it. Once the new install works,"
+    info "      delete its .git, .venv, and source files by hand; keep the rest."
+    info ""
+  fi
+}
+
 do_uninstall() {
-  info "Removing myai install..."
+  check_install_dir
+  note_legacy_install
+
+  if [ -d "$MYAI_INSTALL_DIR" ] && ! is_myai_install "$MYAI_INSTALL_DIR"; then
+    die "$MYAI_INSTALL_DIR does not look like a myai install (no .git + myai pyproject.toml); not removing it"
+  fi
+
+  link="$MYAI_BIN_DIR/myai"
+  remove_link=0
+  if [ -L "$link" ]; then
+    case "$(readlink "$link")" in
+      "$MYAI_INSTALL_DIR"/*) remove_link=1 ;;
+    esac
+  fi
+
+  info "This will remove:"
+  if [ -d "$MYAI_INSTALL_DIR" ]; then info "  $MYAI_INSTALL_DIR"; fi
+  if [ "$remove_link" = 1 ]; then info "  $link"; fi
+  if [ ! -d "$MYAI_INSTALL_DIR" ] && [ "$remove_link" = 0 ]; then
+    info "  (nothing found)"
+    return 0
+  fi
+  if ! confirm "Proceed? [y/N] "; then
+    info "Aborted."
+    exit 0
+  fi
+
   if [ -d "$MYAI_INSTALL_DIR" ]; then
-    info "  deleting $MYAI_INSTALL_DIR"
     rm -rf "$MYAI_INSTALL_DIR"
   fi
-  if [ -e "$MYAI_BIN_DIR/myai" ]; then
-    info "  deleting $MYAI_BIN_DIR/myai"
-    rm -f "$MYAI_BIN_DIR/myai"
+  if [ "$remove_link" = 1 ]; then
+    rm -f "$link"
+  elif [ -e "$link" ] || [ -L "$link" ]; then
+    info "left $link in place (not a link into $MYAI_INSTALL_DIR)"
   fi
-  info "Done."
+  info "Done. Your data in $(state_dir) and ~/.myai was not touched."
 }
 
 install_myai_git() {
+  check_install_dir
+  note_legacy_install
   ensure_prerequisites
   print_changes_summary
 
@@ -448,20 +515,20 @@ usage() {
 myai installer
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/OWNER/myai/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/devinreuschel/myai/main/install.sh | sh
   install.sh [--yes] [--no-install-deps] [--uninstall] [--help]
 
 Options:
   --yes, -y           Skip confirmation prompts
   --no-install-deps   Do not offer to install missing git/Python
-  --uninstall         Remove install dir and CLI symlink
+  --uninstall         Remove install dir and CLI symlink (keeps your data)
   --help              Show this help
 
 Environment:
   MYAI_INSTALL_METHOD   Install backend (default: git)
   MYAI_REPO             Git clone URL
   MYAI_REF              Branch or tag (default: main)
-  MYAI_INSTALL_DIR      Install location (default: ~/.local/share/myai)
+  MYAI_INSTALL_DIR      Install location (default: ~/.local/share/myai-app)
   MYAI_BIN_DIR          CLI symlink dir (default: ~/.local/bin)
   MYAI_ASSUME_YES       Set to 1 to skip prompts (same as --yes)
 EOF
